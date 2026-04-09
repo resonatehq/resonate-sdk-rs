@@ -125,12 +125,15 @@ All builders support `.await` (sequential) or `.spawn().await` (parallel, return
 
 ### Builder options
 
-Every execution builder supports:
+All builders support:
 
 - `.timeout(Duration)` — execution timeout
+- `.target(&str)` — target worker group
+
+Client-side builders (`resonate.run()`, `resonate.rpc()`) additionally support:
+
 - `.version(u32)` — version tag
 - `.tags(HashMap<String, String>)` — metadata tags
-- `.target(&str)` — target worker group
 
 ### Function annotation
 
