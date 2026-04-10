@@ -70,15 +70,15 @@ Run a server with `resonate dev` (install via `brew install resonatehq/tap/reson
 
 ## Parallel execution
 
-Use `ctx.rpc().spawn()` to fan out durable tasks in parallel:
+Use `.spawn()` to fan out durable tasks in parallel:
 
 ```rust
 #[resonate::function]
 async fn fan_out(ctx: &Context) -> Result<Vec<String>> {
     // Spawn tasks in parallel
-    let h1 = ctx.rpc::<String>("process", "alpha".into()).spawn().await?;
-    let h2 = ctx.rpc::<String>("process", "beta".into()).spawn().await?;
-    let h3 = ctx.rpc::<String>("process", "gamma".into()).spawn().await?;
+    let h1 = ctx.run(process, "alpha".into()).spawn().await?;
+    let h2 = ctx.run(process, "beta".into()).spawn().await?;
+    let h3 = ctx.run(process, "gamma".into()).spawn().await?;
 
     // Collect results — each is individually durable
     let r1 = h1.await?;
