@@ -368,6 +368,7 @@ impl Resonate {
         });
         let encoded_param = self.codec.encode(&param_data)?;
         let mut tags = opts.tags.clone();
+        tags.reserve(5);
         Self::build_root_tags(&prefixed_id, &opts.target, &mut tags);
         Ok((
             prefixed_id.clone(),
