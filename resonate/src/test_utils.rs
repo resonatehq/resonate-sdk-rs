@@ -559,6 +559,11 @@ pub fn test_target_resolver() -> crate::context::TargetResolver {
     std::sync::Arc::new(|target: Option<&str>| target.unwrap_or("default").to_string())
 }
 
+/// Default empty state map for tests.
+fn empty_state() -> crate::resonate::StateMap {
+    std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()))
+}
+
 /// Build a root Context for testing with mock effects.
 pub fn test_context(id: &str, effects: Effects) -> Context {
     Context::root(
@@ -567,6 +572,7 @@ pub fn test_context(id: &str, effects: Effects) -> Context {
         "test".to_string(),
         effects,
         test_target_resolver(),
+        empty_state(),
     )
 }
 
@@ -582,6 +588,7 @@ pub fn test_context_with_match(
         "test".to_string(),
         effects,
         target_resolver,
+        empty_state(),
     )
 }
 
@@ -593,6 +600,7 @@ pub fn test_context_with_timeout(id: &str, timeout_at: i64, effects: Effects) ->
         "test".to_string(),
         effects,
         test_target_resolver(),
+        empty_state(),
     )
 }
 

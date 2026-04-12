@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use crate::resonate::StateMap;
+
 use crate::codec::deserialize_error;
 use crate::durable::{Durable, ExecutionEnv};
 use crate::effects::Effects;
@@ -50,6 +52,7 @@ pub struct Context {
     target_resolver: TargetResolver,
     spawned_remote: Arc<Mutex<Vec<String>>>,
     spawned_locals: Arc<Mutex<Vec<SpawnedLocal>>>,
+    state: StateMap,
 }
 
 impl Context {
@@ -60,6 +63,7 @@ impl Context {
         func_name: String,
         effects: Effects,
         target_resolver: TargetResolver,
+        state: StateMap,
     ) -> Self {
         Self {
             origin_id: id.clone(),
@@ -73,6 +77,7 @@ impl Context {
             target_resolver,
             spawned_remote: Arc::new(Mutex::new(Vec::new())),
             spawned_locals: Arc::new(Mutex::new(Vec::new())),
+            state,
         }
     }
 
@@ -90,6 +95,7 @@ impl Context {
             target_resolver: self.target_resolver.clone(),
             spawned_remote: Arc::new(Mutex::new(Vec::new())),
             spawned_locals: Arc::new(Mutex::new(Vec::new())),
+            state: self.state.clone(),
         }
     }
 
@@ -157,6 +163,22 @@ impl Context {
 
     pub fn func_name(&self) -> &str {
         &self.func_name
+    }
+
+    /// Retrieve application state by type.
+    /// State is stored via `Resonate::with_state()` at startup.
+    /// Panics if the type was not registered.
+    pub fn state<T: Send + Sync + 'static>(&self) -> Arc<T> {
+        let type_id = std::any::TypeId::of::<T>();
+        let map = self.state.read();
+        map.get(&type_id)
+            .and_then(|arc| arc.clone().downcast::<T>().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "State type {} not registered. Call resonate.with_state() at startup.",
+                    std::any::type_name::<T>()
+                )
+            })
     }
 
     /// Build a local create request.

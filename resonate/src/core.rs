@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use crate::codec::Codec;
 use crate::context::{Context, TargetResolver};
+use crate::resonate::StateMap;
 use crate::durable::ExecutionEnv;
 use crate::effects::Effects;
 use crate::error::{Error, Result};
@@ -37,6 +38,7 @@ pub struct Core {
     heartbeat: Arc<dyn Heartbeat>,
     pid: String,
     ttl: i64,
+    state: StateMap,
 }
 
 impl Core {
@@ -48,6 +50,7 @@ impl Core {
         heartbeat: Arc<dyn Heartbeat>,
         pid: String,
         ttl: i64,
+        state: StateMap,
     ) -> Self {
         Self {
             sender,
@@ -57,6 +60,7 @@ impl Core {
             heartbeat,
             pid,
             ttl,
+            state,
         }
     }
 
@@ -206,6 +210,7 @@ impl Core {
                 task_data.func.clone(),
                 effects,
                 self.target_resolver.clone(),
+                self.state.clone(),
             );
 
             let info = crate::info::Info::new(
@@ -395,6 +400,7 @@ mod tests {
             heartbeat,
             "test-pid".to_string(),
             60_000,
+            std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         )
     }
 
@@ -1173,6 +1179,7 @@ mod tests {
             heartbeat,
             "test-pid".to_string(),
             60_000,
+            std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         )
     }
 
