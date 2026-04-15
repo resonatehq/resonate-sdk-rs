@@ -132,7 +132,7 @@ impl Context {
     fn child_timeout(&self, requested: Option<Duration>) -> i64 {
         let timeout = requested.unwrap_or(Self::DEFAULT_TIMEOUT);
         let now = now_ms();
-        let child_deadline = now + timeout.as_millis() as i64;
+        let child_deadline = now.saturating_add(timeout.as_millis() as i64);
         std::cmp::min(child_deadline, self.timeout_at)
     }
 
