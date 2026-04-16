@@ -18,19 +18,34 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish resonate-macros
-        run: cargo publish --locked -p resonate-macros
+      - name: Check whether resonate-sdk-macros needs publishing
+        id: macros
+        run: |
+          version=$(cargo metadata --format-version=1 --no-deps \
+            | jq -r '.packages[] | select(.name=="resonate-sdk-macros") | .version')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if cargo search resonate-sdk-macros --limit 1 2>/dev/null \
+              | grep -q "^resonate-sdk-macros = \"${version}\""; then
+            echo "resonate-sdk-macros@${version} already on crates.io — skipping publish."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish resonate-sdk-macros
+        if: steps.macros.outputs.publish == 'true'
+        run: cargo publish --locked -p resonate-sdk-macros
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Wait for crates.io to index resonate-macros
+      - name: Wait for crates.io to index resonate-sdk-macros
+        if: steps.macros.outputs.publish == 'true'
         run: |
-          version=$(cargo metadata --format-version=1 --no-deps \
-            | jq -r '.packages[] | select(.name=="resonate-macros") | .version')
-          echo "Waiting for resonate-macros@${version} to appear on crates.io..."
+          version="${{ steps.macros.outputs.version }}"
+          echo "Waiting for resonate-sdk-macros@${version} to appear on crates.io..."
           for i in $(seq 1 60); do
-            if cargo search resonate-macros --limit 1 2>/dev/null \
-                | grep -q "^resonate-macros = \"${version}\""; then
+            if cargo search resonate-sdk-macros --limit 1 2>/dev/null \
+                | grep -q "^resonate-sdk-macros = \"${version}\""; then
               echo "Indexed."
               exit 0
             fi
@@ -39,7 +54,7 @@ jobs:
           echo "Timed out waiting for crates.io indexing." >&2
           exit 1
 
-      - name: Publish resonate
-        run: cargo publish --locked -p resonate
+      - name: Publish resonate-sdk
+        run: cargo publish --locked -p resonate-sdk
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

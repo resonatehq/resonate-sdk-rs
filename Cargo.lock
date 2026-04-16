@@ -1289,7 +1289,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "resonate"
+name = "resonate-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1298,7 +1298,7 @@ dependencies = [
  "futures",
  "parking_lot",
  "reqwest",
- "resonate-macros",
+ "resonate-sdk-macros",
  "serde",
  "serde_json",
  "test-with",
@@ -1308,7 +1308,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "resonate-macros"
+name = "resonate-sdk-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro-crate",
