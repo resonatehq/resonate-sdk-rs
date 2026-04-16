@@ -41,6 +41,7 @@ pub struct Core {
 }
 
 impl Core {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         sender: Sender,
         codec: Codec,
@@ -446,7 +447,7 @@ mod tests {
 
     #[resonate_macros::function]
     async fn use_preload(ctx: &Context) -> Result<i32> {
-        let v: i32 = ctx.rpc("remote", &()).await?;
+        let v: i32 = ctx.rpc("remote", ()).await?;
         Ok(v)
     }
 

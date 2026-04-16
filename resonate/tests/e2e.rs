@@ -174,8 +174,7 @@ async fn simple_noop() {
     r.register(noop).unwrap();
 
     let id = unique_id("simple-noop");
-    let result: () = with_timeout(r.run(&id, noop, ())).await.unwrap();
-    assert_eq!(result, ());
+    let _: () = with_timeout(r.run(&id, noop, ())).await.unwrap();
 
     r.stop().await.unwrap();
 }
