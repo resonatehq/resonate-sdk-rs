@@ -1,49 +1,50 @@
 # Resonate Rust SDK
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![ci](https://github.com/resonatehq/resonate-sdk-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/resonatehq/resonate-sdk-rs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-The Resonate Rust SDK lets you build reliable, distributed applications using Rust's async/await model.
-Built on [tokio](https://tokio.rs), it gives you durable execution with automatic recovery, idempotency, and distributed coordination — without the infrastructure headache.
+> **Early development.** The Rust SDK is v0.1.0 and not yet published on crates.io. APIs may change between releases.
 
-**Resonate** is a durable execution engine.
-Write your business logic as normal async Rust functions, annotate them with `#[resonate_sdk::function]`, and Resonate handles retries, recovery, and replay.
-If your process crashes mid-workflow, execution resumes from the last checkpoint — not from the beginning.
+## About this component
 
-## Links
+The Resonate Rust SDK enables developers to build reliable and scalable cloud applications in Rust. Built on [tokio](https://tokio.rs), it gives you durable execution with automatic recovery, idempotency, and distributed coordination.
 
-- [Evaluate Resonate](https://docs.resonatehq.io/evaluate/)
-- [Example applications](https://github.com/resonatehq-examples)
-- [Skill guide (Rust SDK)](https://docs.resonatehq.io/develop/rust)
+- [How to contribute to this SDK](./CONTRIBUTING.md)
+- [Evaluate Resonate for your next project](https://docs.resonatehq.io/evaluate/)
+- [Example application library](https://github.com/resonatehq-examples)
+- [Distributed Async Await — the concepts that power Resonate](https://www.distributed-async-await.io/)
+- [Rust SDK guide on docs.resonatehq.io](https://docs.resonatehq.io/develop/rust)
 - [Join the Discord](https://resonatehq.io/discord)
+- [Subscribe to the Journal](https://journal.resonatehq.io/subscribe)
+- [Follow on X](https://x.com/resonatehqio)
+- [Follow on LinkedIn](https://www.linkedin.com/company/resonatehqio)
+- [Subscribe on YouTube](https://www.youtube.com/@resonatehqio)
 
-## Installation
+## Quickstart
 
-```bash
-cargo add resonate-sdk tokio --features tokio/full
-cargo add serde --features derive
+1. Install the Resonate Server & CLI
+
+```shell
+brew install resonatehq/tap/resonate
 ```
 
-Or add to your `Cargo.toml` directly:
+2. Install the Resonate SDK
+
+Because the crate is not yet published on crates.io, add it as a git dependency:
 
 ```toml
 [dependencies]
-resonate-sdk = "0.1"
+resonate-sdk = { git = "https://github.com/resonatehq/resonate-sdk-rs", branch = "main" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-To track the latest development version, use a git dependency:
+3. Write your first Resonate Function
 
-```toml
-[dependencies]
-resonate-sdk = { git = "https://github.com/resonatehq/resonate-sdk-rust", branch = "main" }
-```
-
-## Quick example
+A greeting as a durable workflow. Simple, but the function resumes cleanly from the last checkpoint if the process crashes mid-execution.
 
 ```rust
 use resonate_sdk::prelude::*;
-use serde::{Deserialize, Serialize};
 
 // A workflow function — receives &Context for durable sub-task orchestration.
 #[resonate_sdk::function]
@@ -64,7 +65,6 @@ async fn main() {
         url: Some("http://localhost:8001".into()),
         ..Default::default()
     });
-
     resonate.register(greet).unwrap();
     resonate.register(format_greeting).unwrap();
 
@@ -77,84 +77,41 @@ async fn main() {
 }
 ```
 
-Run a server with `resonate dev` (install via `brew install resonatehq/tap/resonate`), then `cargo run`.
+[Clone a working example repo](https://github.com/resonatehq-examples/example-hello-world-rs)
 
-## Parallel execution
+4. Start the server
 
-Use `.spawn()` to fan out durable tasks in parallel:
-
-```rust
-#[resonate_sdk::function]
-async fn fan_out(ctx: &Context) -> Result<Vec<String>> {
-    // Spawn tasks in parallel
-    let h1 = ctx.run(process, "alpha".into()).spawn().await?;
-    let h2 = ctx.run(process, "beta".into()).spawn().await?;
-    let h3 = ctx.run(process, "gamma".into()).spawn().await?;
-
-    // Collect results — each is individually durable
-    let r1 = h1.await?;
-    let r2 = h2.await?;
-    let r3 = h3.await?;
-
-    Ok(vec![r1, r2, r3])
-}
+```shell
+resonate dev
 ```
 
-If the process crashes after `h1` completes but before `h2` finishes, only `h2` and `h3` re-execute on recovery. `h1`'s result is replayed from the durable log.
+5. Start the worker
 
-## API overview
+```shell
+cargo run
+```
 
-### Entry point
+6. Run the function
 
-| Method | Description |
-|---|---|
-| `Resonate::new(config)` | Connect to a Resonate Server |
-| `Resonate::local()` | In-memory mode (no server needed) |
+Run the function with execution ID `greet-1`:
 
-### Client APIs (Ephemeral World)
+```shell
+resonate invoke greet-1 --func greet --arg "World"
+```
 
-| Method | Description |
-|---|---|
-| `resonate.register(func)` | Register a durable function |
-| `resonate.run(id, func, args)` | Execute a function locally |
-| `resonate.rpc(id, func_name, args)` | Execute a function remotely (by name) |
-| `resonate.schedule(name, cron, func_name, args)` | Schedule a cron-based execution |
-| `resonate.get(id)` | Get a handle to an existing execution |
-| `resonate.stop()` | Graceful shutdown |
-| `resonate.promises` | Sub-client for raw promise operations |
-| `resonate.schedules` | Sub-client for schedule management |
+**Result**
 
-### Context APIs (Durable World)
+You will see the greeting in the terminal:
 
-| Method | Description |
-|---|---|
-| `ctx.run(func, args)` | Invoke a child function locally |
-| `ctx.rpc::<T>(func_name, args)` | Invoke a child function remotely |
-| `ctx.sleep(duration)` | Durable sleep (survives restarts) |
+```shell
+Hello, World!
+```
 
-All builders support `.await` (sequential) or `.spawn().await` (parallel, returns a handle).
+**What to try**
 
-### Builder options
+Try killing the worker mid-execution and restarting. **The workflow resumes from its last durable checkpoint without losing progress.**
 
-All builders support:
-
-- `.timeout(Duration)` — execution timeout
-- `.target(&str)` — target worker group
-
-Client-side builders (`resonate.run()`, `resonate.rpc()`) additionally support:
-
-- `.version(u32)` — version tag
-- `.tags(HashMap<String, String>)` — metadata tags
-
-### Function annotation
-
-`#[resonate_sdk::function]` detects the function kind from the first parameter:
-
-| First parameter | Kind | Description |
-|---|---|---|
-| `&Context` | Workflow | Can orchestrate sub-tasks via `ctx.run()`, `ctx.rpc()`, `ctx.sleep()` |
-| `&Info` | Leaf with metadata | Read-only access to execution metadata |
-| *(anything else)* | Pure leaf | Stateless computation |
+For the full API reference, including entry-point methods, client APIs, Context APIs, builder options, and function annotations, see the [Rust SDK guide](https://docs.resonatehq.io/develop/rust).
 
 ## Environment variables
 
@@ -166,9 +123,8 @@ Client-side builders (`resonate.run()`, `resonate.rpc()`) additionally support:
 | `RESONATE_TOKEN` | JWT auth token | *(unset)* |
 | `RESONATE_PREFIX` | Promise ID prefix | *(empty)* |
 
-Constructor arguments take precedence over environment variables.
-If no URL is configured, the SDK runs in local mode (in-memory, no server required).
+Constructor arguments take precedence over environment variables. If no URL is configured, the SDK runs in local mode (in-memory, no server required).
 
 ## License
 
-Apache-2.0
+Apache-2.0 — see [LICENSE](./LICENSE).
