@@ -1140,10 +1140,7 @@ impl<'ctx> DetachedTask<'ctx> {
     pub async fn spawn(self) -> Result<String> {
         Context::check_serialization_error(&self.serialization_error)?;
         let DetachedTask {
-            child_id,
-            ctx,
-            req,
-            ..
+            child_id, ctx, req, ..
         } = self;
         ctx.effects.create_promise(req).await?;
         tracing::info!(

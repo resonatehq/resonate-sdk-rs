@@ -2414,7 +2414,12 @@ mod tests {
         let prefix = "e2e-det.";
         assert!(id.starts_with(prefix), "id = {}", id);
         let suffix = &id[prefix.len()..];
-        assert_eq!(suffix.len(), 16, "suffix should be 16 hex chars: {}", suffix);
+        assert_eq!(
+            suffix.len(),
+            16,
+            "suffix should be 16 hex chars: {}",
+            suffix
+        );
         assert!(
             suffix.chars().all(|c| c.is_ascii_hexdigit()),
             "suffix not hex: {}",
@@ -2431,7 +2436,11 @@ mod tests {
 
         // The detached promise must be reachable on the server.
         let handle = r.get::<i64>(&id).await;
-        assert!(handle.is_ok(), "detached promise should exist: {:?}", handle.err());
+        assert!(
+            handle.is_ok(),
+            "detached promise should exist: {:?}",
+            handle.err()
+        );
     }
 
     #[tokio::test]
@@ -2489,11 +2498,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = r
-            .transport()
-            .send_json(promise_get_req(&id))
-            .await
-            .unwrap();
+        let resp = r.transport().send_json(promise_get_req(&id)).await.unwrap();
         let tags = &resp["data"]["promise"]["tags"];
         assert_eq!(tags["resonate:scope"].as_str().unwrap(), "global");
         assert_eq!(
@@ -2501,14 +2506,8 @@ mod tests {
             "local://any@custom-worker"
         );
         // Lineage is preserved: parent/origin point back to the workflow.
-        assert_eq!(
-            tags["resonate:origin"].as_str().unwrap(),
-            "e2e-det-target"
-        );
-        assert_eq!(
-            tags["resonate:parent"].as_str().unwrap(),
-            "e2e-det-target"
-        );
+        assert_eq!(tags["resonate:origin"].as_str().unwrap(), "e2e-det-target");
+        assert_eq!(tags["resonate:parent"].as_str().unwrap(), "e2e-det-target");
     }
 
     #[tokio::test]
