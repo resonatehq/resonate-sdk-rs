@@ -51,8 +51,7 @@ jobs:
             -p 8001:8001 \
             resonatehqio/resonate:latest
           for i in $(seq 1 60); do
-            if curl -sf http://localhost:8001/promises >/dev/null 2>&1 \
-               || curl -sf http://localhost:8001/ >/dev/null 2>&1; then
+            if curl -s -o /dev/null http://localhost:8001/ 2>&1; then
               echo "Resonate server is up."
               exit 0
             fi
