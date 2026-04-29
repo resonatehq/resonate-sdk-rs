@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/banner.png" alt="Resonate Rust SDK — Durable Execution · Dead Simple" />
+  <img src="./assets/banner.png" alt="Resonate Rust SDK" />
 </p>
 
 # Resonate Rust SDK
@@ -17,7 +17,6 @@ The Resonate Rust SDK enables developers to build reliable and scalable cloud ap
 - [Evaluate Resonate for your next project](https://docs.resonatehq.io/evaluate/)
 - [Example application library](https://github.com/resonatehq-examples)
 - [Distributed Async Await — the concepts that power Resonate](https://www.distributed-async-await.io/)
-- [Rust SDK guide on docs.resonatehq.io](https://docs.resonatehq.io/develop/rust)
 - [Join the Discord](https://resonatehq.io/discord)
 - [Subscribe to the Journal](https://journal.resonatehq.io/subscribe)
 - [Follow on X](https://x.com/resonatehqio)
@@ -26,7 +25,7 @@ The Resonate Rust SDK enables developers to build reliable and scalable cloud ap
 
 ## Quickstart
 
-![quickstart banner](./assets/quickstart-banner.png)
+![Quickstart](./assets/quickstart-banner.png)
 
 1. Install the Resonate Server & CLI
 

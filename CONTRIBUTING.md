@@ -17,4 +17,4 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The same commands run in CI on every pull request — see [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
+CI gates merging on `cargo fmt --all --check` (no in-place rewrite), `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`. Run `cargo fmt --all` locally before pushing so the `--check` gate passes. See [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) for the full workflow.
