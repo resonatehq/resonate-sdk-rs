@@ -7,9 +7,8 @@ The Rust SDK for [Resonate](https://resonatehq.io). Targets the v0.9.x Rust serv
 ## Status
 
 - **Latest published:** `resonate-sdk` 0.4.0 on crates.io (2026-04-28). Published 0.1.0, 0.3.0, 0.4.0; 0.2.0 is GitHub-release-only.
-- **Cadence:** very active. Andres lands near-daily commits; releases come in clusters of 2-3 per week.
+- **Cadence:** very active — near-daily commits; releases come in clusters of 2-3 per week.
 - **API surface:** post-rename (PR #7 merged 2026-04-15) — promise API uses `.resolve()` / `.reject()` / `.cancel()`. The pre-rename `.settle()` shape is gone.
-- **Owner:** Andres Villegas (avillega)
 
 ## Stack
 
@@ -38,7 +37,7 @@ cargo clippy --all-targets --all-features  # clippy lints
 
 The end-to-end tests in `resonate/tests/e2e.rs` use `test-with` to gate on a running Resonate server. Run a server first (`brew install resonatehq/tap/resonate && resonate dev`) to exercise the full integration matrix; otherwise unit tests run alone.
 
-Cully prefers to run long-lived processes himself. Run one-shot commands (build, test, fmt, clippy) freely; don't auto-start a server or watcher.
+Run one-shot commands (build, test, fmt, clippy) freely; don't auto-start a server or watcher — the operator runs long-lived processes themselves.
 
 ## Architecture notes
 
@@ -55,7 +54,7 @@ Cully prefers to run long-lived processes himself. Run one-shot commands (build,
 
 ## Rules
 
-1. **No `cargo publish` without explicit Cully approval** for that specific publish, in the same session. Andres handles publishes; agents draft, don't ship.
+1. **No `cargo publish` without explicit Cully approval** for that specific publish, in the same session. The release workflow handles publishes; agents draft, don't ship.
 2. **No pushing to `main` directly.** Open a PR; CI runs the test matrix.
 3. **Workspace versions are coupled.** `resonate` and `resonate-macros` ship together via the workspace `version.workspace = true`; the `bump-version.sh` script keeps them aligned.
 4. **Server protocol is upstream.** `PROTOCOL_VERSION` in `src/lib.rs` matches the targeted server release; don't bump it without coordinating against the server repo.
