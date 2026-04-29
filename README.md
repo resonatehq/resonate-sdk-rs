@@ -1,9 +1,13 @@
+<p align="center">
+  <img src="./assets/banner.png" alt="Resonate Rust SDK — Durable Execution · Dead Simple" />
+</p>
+
 # Resonate Rust SDK
 
 [![ci](https://github.com/resonatehq/resonate-sdk-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/resonatehq/resonate-sdk-rs/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-> **Early development.** The Rust SDK is v0.1.0 and not yet published on crates.io. APIs may change between releases.
+> **Early development.** APIs may change between releases.
 
 ## About this component
 
@@ -22,6 +26,8 @@ The Resonate Rust SDK enables developers to build reliable and scalable cloud ap
 
 ## Quickstart
 
+![quickstart banner](./assets/quickstart-banner.png)
+
 1. Install the Resonate Server & CLI
 
 ```shell
@@ -30,18 +36,15 @@ brew install resonatehq/tap/resonate
 
 2. Install the Resonate SDK
 
-Because the crate is not yet published on crates.io, add it as a git dependency:
-
-```toml
-[dependencies]
-resonate-sdk = { git = "https://github.com/resonatehq/resonate-sdk-rs", branch = "main" }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
+```shell
+cargo add resonate-sdk
+cargo add tokio --features full
+cargo add serde --features derive
 ```
 
 3. Write your first Resonate Function
 
-A greeting as a durable workflow. Simple, but the function resumes cleanly from the last checkpoint if the process crashes mid-execution.
+A greeting as a durable workflow. Trivial, but the function survives process restarts mid-execution.
 
 ```rust
 use resonate_sdk::prelude::*;
@@ -56,7 +59,9 @@ async fn greet(ctx: &Context, name: String) -> Result<String> {
 // A leaf function — pure computation, no Context needed.
 #[resonate_sdk::function]
 async fn format_greeting(name: String) -> Result<String> {
-    Ok(format!("Hello, {}!", name))
+    let greeting = format!("Hello, {name}! Welcome to durable execution.");
+    println!("{greeting}");
+    Ok(greeting)
 }
 
 #[tokio::main]
@@ -68,12 +73,8 @@ async fn main() {
     resonate.register(greet).unwrap();
     resonate.register(format_greeting).unwrap();
 
-    let result: String = resonate
-        .run("greet-1", greet, "World".into())
-        .await
-        .expect("workflow failed");
-
-    println!("{result}");
+    println!("Worker started. Waiting for invocations...");
+    tokio::signal::ctrl_c().await.expect("ctrl-c");
 }
 ```
 
@@ -93,25 +94,29 @@ cargo run
 
 6. Run the function
 
-Run the function with execution ID `greet-1`:
+Run the function with execution ID `greet.1`:
 
 ```shell
-resonate invoke greet-1 --func greet --arg "World"
+resonate invoke greet.1 --func greet --arg '"World"'
 ```
 
 **Result**
 
-You will see the greeting in the terminal:
+You will see the greeting in the worker terminal:
 
 ```shell
-Hello, World!
+Hello, World! Welcome to durable execution.
 ```
 
 **What to try**
 
-Try killing the worker mid-execution and restarting. **The workflow resumes from its last durable checkpoint without losing progress.**
+After invoking the function, inspect the current state of the execution using the `resonate tree` command. The tree command visualizes the call graph of the function execution as a graph of durable promises.
 
-For the full API reference, including entry-point methods, client APIs, Context APIs, builder options, and function annotations, see the [Rust SDK guide](https://docs.resonatehq.io/develop/rust).
+```shell
+resonate tree greet.1
+```
+
+Now try killing the worker mid-execution and restarting. **The workflow resumes from its last durable checkpoint without losing progress.**
 
 ## Environment variables
 
@@ -124,7 +129,3 @@ For the full API reference, including entry-point methods, client APIs, Context 
 | `RESONATE_PREFIX` | Promise ID prefix | *(empty)* |
 
 Constructor arguments take precedence over environment variables. If no URL is configured, the SDK runs in local mode (in-memory, no server required).
-
-## License
-
-Apache-2.0 — see [LICENSE](./LICENSE).
