@@ -530,6 +530,8 @@ impl Resonate {
             cron,
             func_name,
             args,
+            target: None,
+            tags: None,
             timeout: None,
             version: None,
         }
@@ -988,6 +990,8 @@ pub struct ResScheduleTask<'a, Args> {
     cron: &'a str,
     func_name: &'a str,
     args: Args,
+    target: Option<String>,
+    tags: Option<HashMap<String, String>>,
     timeout: Option<Duration>,
     version: Option<u32>,
 }
@@ -1002,6 +1006,23 @@ impl<'a, Args> ResScheduleTask<'a, Args> {
     /// Set the function version.
     pub fn version(mut self, version: u32) -> Self {
         self.version = Some(version);
+        self
+    }
+
+    /// Override the dispatch target for the fired promise. Accepts either a
+    /// bare group name (resolved to `poll://any@<group>`) or a fully-qualified
+    /// `poll://` / `local://` URL. Defaults to the Resonate instance's own
+    /// group, so a worker in that group picks up the fired promise.
+    pub fn target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
+        self
+    }
+
+    /// Set additional tags on the fired promise. `resonate:invoke` is set
+    /// automatically from `target`; user-supplied tags are merged after, so
+    /// callers can override it explicitly if needed.
+    pub fn tags(mut self, tags: HashMap<String, String>) -> Self {
+        self.tags = Some(tags);
         self
     }
 }
@@ -1026,6 +1047,21 @@ impl<'a, Args: Serialize + Send + 'a> IntoFuture for ResScheduleTask<'a, Args> {
 
             let template = format!("{}{{{{.id}}}}.{{{{.timestamp}}}}", self.resonate.id_prefix);
 
+            // Build the fired-promise tags. `resonate:invoke` tells the server
+            // where to dispatch the promise once the cron fires; without it
+            // the promise sits pending and the schedule is effectively inert.
+            let raw_target = self
+                .target
+                .unwrap_or_else(|| self.resonate.network.group().to_string());
+            let resolved_target = resolve_target(&*self.resonate.network, &raw_target);
+            let mut promise_tags = HashMap::new();
+            promise_tags.insert("resonate:invoke".to_string(), resolved_target);
+            if let Some(extra) = self.tags {
+                for (k, v) in extra {
+                    promise_tags.insert(k, v);
+                }
+            }
+
             self.resonate
                 .schedules
                 .create(
@@ -1034,6 +1070,7 @@ impl<'a, Args: Serialize + Send + 'a> IntoFuture for ResScheduleTask<'a, Args> {
                     &template,
                     timeout.as_millis() as i64,
                     encoded_param,
+                    promise_tags,
                 )
                 .await?;
 

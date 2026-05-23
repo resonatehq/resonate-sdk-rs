@@ -732,6 +732,7 @@ async fn schedules_create_and_get() {
         &promise_tpl,
         60_000,
         Value::default(),
+        HashMap::new(),
     ))
     .await
     .unwrap();
@@ -770,7 +771,7 @@ async fn schedules_search() {
 
     with_timeout(
         r.schedules
-            .create(&id, "0 * * * *", &promise_tpl, 60_000, Value::default()),
+            .create(&id, "0 * * * *", &promise_tpl, 60_000, Value::default(), HashMap::new()),
     )
     .await
     .unwrap();
