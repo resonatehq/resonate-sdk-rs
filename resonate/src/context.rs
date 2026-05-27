@@ -554,7 +554,7 @@ where
     ///
     /// Must be called before `.id()`, `.await`, or `.spawn()`.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        debug_assert!(
+        assert!(
             self.record.get().is_none(),
             "cannot set timeout after promise creation"
         );
@@ -647,7 +647,7 @@ where
                     // (e.g. a pending ctx.rpc().await), handle it directly
                     // instead of letting it fall through as an application error.
                     if matches!(&result, Err(Error::Suspended)) {
-                        debug_assert!(
+                        assert!(
                             !child_remote.is_empty(),
                             "Suspended error but no remote todos — this is a bug"
                         );
@@ -755,7 +755,7 @@ where
             // Explicit suspension handling: propagate Suspended directly
             // instead of letting it fall through as an application error.
             if matches!(&result, Err(Error::Suspended)) {
-                debug_assert!(
+                assert!(
                     !child_remote.is_empty(),
                     "Suspended error but no remote todos — this is a bug"
                 );
@@ -798,7 +798,7 @@ impl<'ctx, T> RpcTask<'ctx, T> {
     ///
     /// Must be called before `.id()`, `.await`, or `.spawn()`.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        debug_assert!(
+        assert!(
             self.record.get().is_none(),
             "cannot set timeout after promise creation"
         );
@@ -810,7 +810,7 @@ impl<'ctx, T> RpcTask<'ctx, T> {
     ///
     /// Must be called before `.id()`, `.await`, or `.spawn()`.
     pub fn target(mut self, target: &str) -> Self {
-        debug_assert!(
+        assert!(
             self.record.get().is_none(),
             "cannot set target after promise creation"
         );
@@ -926,7 +926,7 @@ impl<'ctx, T> PromiseTask<'ctx, T> {
     ///
     /// Must be called before `.id()`, `.await`, or `.create()`.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        debug_assert!(
+        assert!(
             self.record.get().is_none(),
             "cannot set timeout after promise creation"
         );
@@ -938,7 +938,7 @@ impl<'ctx, T> PromiseTask<'ctx, T> {
     ///
     /// Must be called before `.id()`, `.await`, or `.create()`.
     pub fn data(mut self, data: &impl Serialize) -> Result<Self> {
-        debug_assert!(
+        assert!(
             self.record.get().is_none(),
             "cannot set data after promise creation"
         );
