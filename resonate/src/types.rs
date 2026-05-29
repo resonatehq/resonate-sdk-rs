@@ -587,8 +587,7 @@ mod tests {
             ("null", serde_json::Value::Null),
         ];
         for (raw, expected) in cases {
-            let body =
-                format!(r#"{{"id":"t","state":"pending","version":1,"resumes":{raw}}}"#);
+            let body = format!(r#"{{"id":"t","state":"pending","version":1,"resumes":{raw}}}"#);
             let r: TaskRecord = serde_json::from_str(&body).unwrap();
             assert_eq!(r.resumes, expected);
         }
@@ -653,10 +652,9 @@ mod tests {
 
     #[test]
     fn schedule_record_decode_minimal_applies_defaults() {
-        let r: ScheduleRecord = serde_json::from_str(
-            r#"{"id":"s1","cron":"c","promiseId":"p1","promiseTimeout":100}"#,
-        )
-        .unwrap();
+        let r: ScheduleRecord =
+            serde_json::from_str(r#"{"id":"s1","cron":"c","promiseId":"p1","promiseTimeout":100}"#)
+                .unwrap();
         assert_eq!(r.promise_param.data_or_null(), serde_json::Value::Null);
         assert!(r.promise_tags.is_empty());
         assert_eq!(r.created_at, 0);
@@ -748,8 +746,7 @@ mod tests {
     #[test]
     fn promise_settle_req_decode() {
         let r: PromiseSettleReq =
-            serde_json::from_str(r#"{"id":"p1","state":"rejected_canceled","value":{}}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"id":"p1","state":"rejected_canceled","value":{}}"#).unwrap();
         assert_eq!(r.id, "p1");
         assert_eq!(r.state, SettleState::RejectedCanceled);
         assert_eq!(r.value.data_or_null(), serde_json::Value::Null);
