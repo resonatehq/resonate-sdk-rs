@@ -97,7 +97,7 @@ pub struct ScheduleCreateReq {
 /// server operation. It handles JSON serialization, response parsing,
 /// and error conversion so callers never deal with raw JSON.
 ///
-/// Cloning is cheap — Transport wraps `Arc<dyn Network>`.
+/// Cloning is inexpensive — Transport wraps `Arc<dyn Network>`.
 #[derive(Clone)]
 pub struct Sender {
     transport: Transport,
