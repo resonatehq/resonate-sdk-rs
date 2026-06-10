@@ -2284,7 +2284,7 @@ mod tests {
 
     #[resonate_sdk_macros::function]
     async fn spawn_child(ctx: &Context) -> Result<i64> {
-        let h = ctx.run(multiply, (3_i64, 5_i64)).spawn().await?;
+        let h = ctx.run(multiply, (3_i64, 5_i64)).spawn()?;
         let result = h.await?;
         Ok(result)
     }
@@ -2394,15 +2394,19 @@ mod tests {
 
     #[resonate_sdk_macros::function]
     async fn detacher_one(ctx: &Context) -> Result<String> {
-        let id = ctx.detached("remote_handler", (42_i64,)).spawn().await?;
+        let id = ctx
+            .detached("remote_handler", (42_i64,))
+            .spawn()?
+            .id()
+            .await?;
         Ok(id)
     }
 
     #[resonate_sdk_macros::function]
     async fn detacher_many(ctx: &Context) -> Result<Vec<String>> {
-        let a = ctx.detached("h", (1_i64,)).spawn().await?;
-        let b = ctx.detached("h", (2_i64,)).spawn().await?;
-        let c = ctx.detached("h", (3_i64,)).spawn().await?;
+        let a = ctx.detached("h", (1_i64,)).spawn()?.id().await?;
+        let b = ctx.detached("h", (2_i64,)).spawn()?.id().await?;
+        let c = ctx.detached("h", (3_i64,)).spawn()?.id().await?;
         Ok(vec![a, b, c])
     }
 
@@ -2411,7 +2415,8 @@ mod tests {
         let id = ctx
             .detached("remote_handler", (1_i64,))
             .target("custom-worker")
-            .spawn()
+            .spawn()?
+            .id()
             .await?;
         Ok(id)
     }
