@@ -98,10 +98,7 @@ impl StubNetwork {
                 }
             }
             "task.fulfill" => (200, self.handle_task_fulfill(&data)),
-            "task.suspend" => {
-                let (s, d) = self.handle_task_suspend(&data);
-                (s, d)
-            }
+            "task.suspend" => self.handle_task_suspend(&data),
             "task.release" => (200, self.handle_task_release(&data)),
             _ => (
                 400,

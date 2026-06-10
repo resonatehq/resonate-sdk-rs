@@ -116,20 +116,16 @@ impl Resonate {
     /// `LocalNetwork` — `config.url` and any `RESONATE_URL`/`RESONATE_HOST`
     /// env vars are ignored. Use this in tests or local-mode applications
     /// that need to set fields like `prefix` while staying off the network.
-    pub fn local_with(config: ResonateConfig) -> Self {
-        let pid = config.pid.or_else(|| Some("default".to_string()));
-        let group = config.group.or_else(|| Some("default".to_string()));
-        let net: Arc<dyn Network> = Arc::new(LocalNetwork::new(pid.clone(), group.clone()));
-        Self::new(ResonateConfig {
-            url: None,
-            pid,
-            group,
-            ttl: config.ttl.or(Some(u64::MAX)),
-            token: config.token,
-            encryptor: config.encryptor,
-            network: Some(net),
-            prefix: config.prefix,
-        })
+    pub fn local_with(mut config: ResonateConfig) -> Self {
+        config.pid.get_or_insert_with(|| "default".to_string());
+        config.group.get_or_insert_with(|| "default".to_string());
+        config.ttl.get_or_insert(u64::MAX);
+        config.url = None;
+        config.network = Some(Arc::new(LocalNetwork::new(
+            config.pid.clone(),
+            config.group.clone(),
+        )));
+        Self::new(config)
     }
 
     // ═══════════════════════════════════════════════════════════════

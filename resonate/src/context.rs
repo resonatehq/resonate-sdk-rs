@@ -163,6 +163,16 @@ impl Context {
         &self.func_name
     }
 
+    /// Build the lineage tags shared by every child promise create request.
+    fn child_tags(&self, scope: &str, branch: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("resonate:scope".to_string(), scope.to_string()),
+            ("resonate:branch".to_string(), branch.to_string()),
+            ("resonate:parent".to_string(), self.id.clone()),
+            ("resonate:origin".to_string(), self.origin_id.clone()),
+        ])
+    }
+
     /// Build a local create request.
     fn local_create_req(
         &self,
@@ -170,11 +180,7 @@ impl Context {
         args: &impl Serialize,
         timeout: Option<Duration>,
     ) -> Result<PromiseCreateReq> {
-        let mut tags = HashMap::with_capacity(4);
-        tags.insert("resonate:scope".to_string(), "local".to_string());
-        tags.insert("resonate:branch".to_string(), self.branch_id.clone());
-        tags.insert("resonate:parent".to_string(), self.id.clone());
-        tags.insert("resonate:origin".to_string(), self.origin_id.clone());
+        let tags = self.child_tags("local", &self.branch_id);
 
         Ok(PromiseCreateReq {
             id: id.to_string(),
@@ -197,12 +203,8 @@ impl Context {
         target_override: Option<&str>,
     ) -> Result<PromiseCreateReq> {
         let target = (self.target_resolver)(target_override);
-        let mut tags = HashMap::with_capacity(5);
-        tags.insert("resonate:scope".to_string(), "global".to_string());
+        let mut tags = self.child_tags("global", id);
         tags.insert("resonate:target".to_string(), target);
-        tags.insert("resonate:branch".to_string(), id.to_string());
-        tags.insert("resonate:parent".to_string(), self.id.clone());
-        tags.insert("resonate:origin".to_string(), self.origin_id.clone());
 
         Ok(PromiseCreateReq {
             id: id.to_string(),
@@ -252,20 +254,11 @@ impl Context {
     /// Similar to `sleep_create_req` but without `resonate:timer` — the promise
     /// is expected to be resolved externally (webhook, human, another process).
     fn promise_create_req(&self, id: &str, timeout: Option<Duration>) -> PromiseCreateReq {
-        let mut tags = HashMap::with_capacity(4);
-        tags.insert("resonate:scope".to_string(), "global".to_string());
-        tags.insert("resonate:branch".to_string(), id.to_string());
-        tags.insert("resonate:parent".to_string(), self.id.clone());
-        tags.insert("resonate:origin".to_string(), self.origin_id.clone());
-
         PromiseCreateReq {
             id: id.to_string(),
             timeout_at: self.child_timeout(timeout),
-            param: Value {
-                headers: None,
-                data: None,
-            },
-            tags,
+            param: Value::default(),
+            tags: self.child_tags("global", id),
         }
     }
 
@@ -273,20 +266,13 @@ impl Context {
     ///
     /// Similar to `remote_create_req` but with `resonate:timer` tag and no target.
     fn sleep_create_req(&self, id: &str, duration: Duration) -> PromiseCreateReq {
-        let mut tags = HashMap::with_capacity(5);
-        tags.insert("resonate:scope".to_string(), "global".to_string());
-        tags.insert("resonate:branch".to_string(), id.to_string());
-        tags.insert("resonate:parent".to_string(), self.id.clone());
-        tags.insert("resonate:origin".to_string(), self.origin_id.clone());
+        let mut tags = self.child_tags("global", id);
         tags.insert("resonate:timer".to_string(), "true".to_string());
 
         PromiseCreateReq {
             id: id.to_string(),
             timeout_at: self.child_timeout(Some(duration)),
-            param: Value {
-                headers: None,
-                data: None,
-            },
+            param: Value::default(),
             tags,
         }
     }
