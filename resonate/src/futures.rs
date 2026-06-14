@@ -2,9 +2,9 @@ use std::future::IntoFuture;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
-use crate::sequencing::{await_created_id, CreationState};
 #[cfg(test)]
 use crate::sequencing::creation_channel;
+use crate::sequencing::{await_created_id, CreationState};
 
 /// Shared state of a spawned-task handle: the promise ID, the creation gate,
 /// and the typed result channel. `DurableFuture` and `RemoteFuture` are thin
