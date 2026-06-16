@@ -15,6 +15,7 @@ pub mod promises;
 pub mod registry;
 pub mod resonate;
 pub mod send;
+pub(crate) mod sequencing;
 pub mod transport;
 pub mod types;
 
@@ -94,7 +95,7 @@ pub mod prelude {
     pub use crate::durable::{Durable, ExecutionEnv};
     pub use crate::effects::Effects;
     pub use crate::error::{Error, Result};
-    pub use crate::futures::{DurableFuture, RemoteFuture};
+    pub use crate::futures::{DetachedHandle, DurableFuture, RemoteFuture};
     pub use crate::handle::ResonateHandle;
     pub use crate::heartbeat::Heartbeat;
     pub use crate::http_network::HttpNetwork;
