@@ -13,7 +13,10 @@ use crate::error::{Error, Result};
 use crate::heartbeat::Heartbeat;
 use crate::registry::Registry;
 use crate::send::{Sender, SuspendResult};
-use crate::types::{DurableKind, PromiseRecord, PromiseState, SettleState, Status, TaskData};
+use crate::types::{
+    DurableKind, Outcome, PromiseRecord, PromiseState, SettleState, Status, TaskData,
+};
+use std::future::Future;
 
 /// Core is the top-level component that manages the full lifecycle of a task.
 /// It takes a `send` function and uses it for all server communication.
@@ -165,8 +168,7 @@ impl Core {
             (entry.func.clone(), entry.kind)
         };
 
-        // 3. SHORT-CIRCUIT: if promise is already settled, fulfill the task
-        //    without executing the function.
+        // 3. SHORT-CIRCUIT
         if promise.state != PromiseState::Pending {
             tracing::info!(
                 task_id = task_id,
@@ -174,131 +176,171 @@ impl Core {
                 state = ?promise.state,
                 "promise already settled, fulfilling task without execution"
             );
-            // Value is already decoded (decode_promise was called before this point)
-            let settled_value = promise.value.data_as_ref().clone();
+            // The promise is already settled on the server, so the settle is a
+            // no-op there: `task.fulfill` only writes the value/state while the
+            // promise is still pending. Fulfilling here just transitions the task
+            // to its terminal state, so we send a null value and skip cloning the
+            // already-decoded settled value (`fulfill_task`'s encode short-circuits
+            // on null, so no re-encode happens either).
             let state = match promise.state {
+                PromiseState::Pending => unreachable!(),
                 PromiseState::Resolved => SettleState::Resolved,
                 PromiseState::Rejected
                 | PromiseState::RejectedCanceled
                 | PromiseState::RejectedTimedout => SettleState::Rejected,
-                PromiseState::Pending => unreachable!(),
             };
-            self.fulfill_task(task_id, task_version, &promise.id, state, settled_value)
-                .await?;
+            self.fulfill_task(
+                task_id,
+                task_version,
+                &promise.id,
+                state,
+                serde_json::Value::Null,
+            )
+            .await?;
             return Ok(Status::Done);
         }
 
-        // 4. EXECUTE in a loop, on redirect, re-execute with new preloaded promises
+        // 4. EXECUTE, on redirect, re-execute with new preloaded promises
         //    without re-acquiring the task.
         let mut current_preload = preload;
         loop {
-            let effects = Effects::new(
-                self.sender.clone(),
-                self.codec.clone(),
-                current_preload.unwrap_or_default(),
-            );
-
-            let ctx = Context::root(
-                promise.id.clone(),
-                promise.timeout_at,
-                task_data.func.clone(),
-                effects,
-                self.target_resolver.clone(),
-                self.deps.clone(),
-            );
-
-            let info = crate::info::Info::new(
-                promise.id.clone(),
-                String::new(),
-                promise.id.clone(),
-                promise.id.clone(),
-                promise.timeout_at,
-                task_data.func.clone(),
-                promise.tags.clone(),
-                self.deps.clone(),
-            );
-
-            // Execute via the func
+            let info;
+            let ctx;
             let env = match kind {
-                DurableKind::Function => ExecutionEnv::Function(&info),
-                DurableKind::Workflow => ExecutionEnv::Workflow(&ctx),
+                DurableKind::Function => {
+                    info = crate::info::Info::new(
+                        promise.id.clone(),
+                        String::new(),
+                        promise.id.clone(),
+                        promise.id.clone(),
+                        promise.timeout_at,
+                        task_data.func.clone(),
+                        promise.tags.clone(),
+                        self.deps.clone(),
+                    );
+                    ExecutionEnv::Function(&info)
+                }
+                DurableKind::Workflow => {
+                    let effects = Effects::new(
+                        self.sender.clone(),
+                        self.codec.clone(),
+                        current_preload.take().unwrap_or_default(),
+                    );
+                    ctx = Context::root(
+                        promise.id.clone(),
+                        promise.timeout_at,
+                        task_data.func.clone(),
+                        effects,
+                        self.target_resolver.clone(),
+                        self.deps.clone(),
+                    );
+                    ExecutionEnv::Workflow(&ctx)
+                }
             };
-            // Catch panics from user-defined functions. This is necessary because
-            // Error::Suspended is a control-flow mechanism (not a real error) and
-            // users may accidentally call .unwrap() on it, causing a panic that
-            // would silently kill the spawned task and leave it in a zombie state.
+
+            let result =
+                Self::run_catching_panics(task_id, (func)(env, task_data.args.clone())).await?;
+
+            // A flush error (e.g. a fire-and-forget promise creation that failed in the background)
+            // fails the whole execution so the task is released and retried.
+            let remote_todos = env.collect_remote_todos().await?;
+
+            // 5. FINALIZE
             //
-            // AssertUnwindSafe is sound here because on panic we skip all
-            // post-execution logic (flush, suspend, fulfill) and return an error
-            // immediately, so we never observe partially-mutated Context state.
-            let result = match AssertUnwindSafe((func)(env, task_data.args.clone()))
-                .catch_unwind()
-                .await
-            {
-                Ok(result) => result,
-                Err(panic_payload) => {
-                    let msg = panic_payload
-                        .downcast_ref::<String>()
-                        .map(|s| s.as_str())
-                        .or_else(|| panic_payload.downcast_ref::<&str>().copied())
-                        .unwrap_or("unknown panic");
-
-                    if msg.contains("execution suspended") {
-                        tracing::error!(
-                            task_id = task_id,
-                            "user function panicked by unwrapping Error::Suspended — \
-                                 use `?` to propagate suspension errors instead of `.unwrap()`"
-                        );
-                    } else {
-                        tracing::error!(task_id = task_id, panic = msg, "user function panicked");
-                    }
-
-                    return Err(Error::Application {
-                        message: format!("user function panicked: {}", msg),
-                    });
-                }
+            // A function suspends iff it left unresolved remote dependencies.
+            // This is independent of `result`: a function can return `Ok` while
+            // still having spawned remote work it never awaited; that work is
+            // what it now waits on. So `remote_todos`, not `result`, decides
+            // whether we finished or suspended.
+            let outcome = if remote_todos.is_empty() {
+                // A `Suspended` sentinel here means a `?`-propagated suspension
+                // left no remote todos behind, a bug, since something must
+                // have been registered for us to wait on. Mirrors the invariant
+                // enforced for child contexts in `Context::finalize`.
+                debug_assert!(!matches!(&result, Err(Error::Suspended)));
+                Outcome::Done(result)
+            } else {
+                Outcome::Suspended { remote_todos }
             };
 
-            // Flush remaining local work
-            let flush_remote = ctx.flush_local_work().await;
-            let mut remote_todos = ctx.take_remote_todos().await;
-            remote_todos.extend(flush_remote);
-
-            // 5. FINALIZE: determine outcome
-            if remote_todos.is_empty() {
-                let (state, value) = match &result {
-                    Ok(val) => (SettleState::Resolved, val.clone()),
-                    Err(err) => (SettleState::Rejected, crate::codec::encode_error(err)),
-                };
-                self.fulfill_task(task_id, task_version, &promise.id, state, value)
-                    .await?;
-                tracing::debug!(task_id = task_id, promise_id = %promise.id, "task fulfilled");
-                return Ok(Status::Done);
-            }
-
-            // 6. SUSPEND: if redirect, loop with new preload; otherwise return Suspended
-            tracing::debug!(
-                task_id = task_id,
-                remote_deps = remote_todos.len(),
-                "attempting to suspend task"
-            );
-            match self
-                .suspend_task(task_id, task_version, remote_todos)
-                .await?
-            {
-                SuspendResult::Suspended => {
-                    tracing::debug!(task_id = task_id, "task suspended");
-                    return Ok(Status::Suspended);
+            match outcome {
+                Outcome::Done(result) => {
+                    let (state, value) = match &result {
+                        Ok(val) => (SettleState::Resolved, val.clone()),
+                        Err(err) => (SettleState::Rejected, crate::codec::encode_error(err)),
+                    };
+                    self.fulfill_task(task_id, task_version, &promise.id, state, value)
+                        .await?;
+                    tracing::debug!(task_id = task_id, promise_id = %promise.id, "task fulfilled");
+                    return Ok(Status::Done);
                 }
-                SuspendResult::Redirect { preload } => {
+                // on redirect, loop with new preload; otherwise return Suspended.
+                Outcome::Suspended { remote_todos } => {
                     tracing::debug!(
                         task_id = task_id,
-                        preload = preload.len(),
-                        "suspend returned redirect, re-executing task"
+                        remote_deps = remote_todos.len(),
+                        "attempting to suspend task"
                     );
-                    current_preload = Some(preload);
-                    continue;
+                    match self
+                        .suspend_task(task_id, task_version, remote_todos)
+                        .await?
+                    {
+                        SuspendResult::Suspended => {
+                            tracing::debug!(task_id = task_id, "task suspended");
+                            return Ok(Status::Suspended);
+                        }
+                        SuspendResult::Redirect { preload } => {
+                            tracing::debug!(
+                                task_id = task_id,
+                                preload = preload.len(),
+                                "suspend returned redirect, re-executing task"
+                            );
+                            current_preload = Some(preload);
+                            continue;
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    /// Run a user function future, converting any panic into an error.
+    ///
+    /// This is necessary because `Error::Suspended` is a control-flow mechanism
+    /// (not a real error) and users may accidentally call `.unwrap()` on it,
+    /// causing a panic that would otherwise silently kill the spawned task and
+    /// leave it in a zombie state. The returned `Err` propagates up so the
+    /// caller releases the task for retry.
+    ///
+    /// `AssertUnwindSafe` is sound here because on panic the caller skips all
+    /// post-execution logic (flush, suspend, fulfill) and returns immediately,
+    /// so it never observes partially-mutated `Context` state.
+    async fn run_catching_panics<F>(task_id: &str, fut: F) -> Result<Result<serde_json::Value>>
+    where
+        F: Future<Output = Result<serde_json::Value>>,
+    {
+        match AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(result) => Ok(result),
+            Err(panic_payload) => {
+                let msg = panic_payload
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+
+                if msg.contains("execution suspended") {
+                    tracing::error!(
+                        task_id = task_id,
+                        "user function panicked by unwrapping Error::Suspended — \
+                             use `?` to propagate suspension errors instead of `.unwrap()`"
+                    );
+                } else {
+                    tracing::error!(task_id = task_id, panic = msg, "user function panicked");
+                }
+
+                Err(Error::Application {
+                    message: format!("user function panicked: {}", msg),
+                })
             }
         }
     }
@@ -419,15 +461,15 @@ mod tests {
     /// Workflow that suspends on a single remote dependency.
     #[resonate_sdk_macros::function]
     async fn suspending_once(ctx: &Context) -> Result<i64> {
-        let _ = ctx.rpc::<i32>("dep", &()).spawn().await?;
+        let _ = ctx.rpc::<i32>("dep", &()).spawn()?;
         Ok(0)
     }
 
     /// Workflow that suspends on two remote dependencies.
     #[resonate_sdk_macros::function]
     async fn suspending_multi(ctx: &Context) -> Result<i64> {
-        let _ = ctx.rpc::<i32>("dep-a", &()).spawn().await?;
-        let _ = ctx.rpc::<i32>("dep-b", &()).spawn().await?;
+        let _ = ctx.rpc::<i32>("dep-a", &()).spawn()?;
+        let _ = ctx.rpc::<i32>("dep-b", &()).spawn()?;
         Ok(0)
     }
 
@@ -438,7 +480,7 @@ mod tests {
     async fn suspending_then_done(ctx: &Context) -> Result<i64> {
         let count = COMP_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
         if count == 0 {
-            let _ = ctx.rpc::<i32>("dep", &()).spawn().await?;
+            let _ = ctx.rpc::<i32>("dep", &()).spawn()?;
             Ok(0)
         } else {
             Ok(42)
@@ -453,7 +495,7 @@ mod tests {
 
     #[resonate_sdk_macros::function]
     async fn remote_dep(ctx: &Context) -> Result<i32> {
-        let _ = ctx.rpc::<i32>("dep-a", &()).spawn().await?;
+        let _ = ctx.rpc::<i32>("dep-a", &()).spawn()?;
         Ok(0)
     }
 
@@ -635,7 +677,7 @@ mod tests {
     async fn redir_no_acquire(ctx: &Context) -> Result<i64> {
         let count = REDIR_NO_ACQUIRE_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
         if count == 0 {
-            let _ = ctx.rpc::<i32>("dep", &()).spawn().await?;
+            let _ = ctx.rpc::<i32>("dep", &()).spawn()?;
             Ok(0)
         } else {
             Ok(42)
@@ -679,7 +721,7 @@ mod tests {
     async fn redir_preload(ctx: &Context) -> Result<i64> {
         let count = REDIR_PRELOAD_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
         if count == 0 {
-            let _ = ctx.rpc::<i32>("dep", &()).spawn().await?;
+            let _ = ctx.rpc::<i32>("dep", &()).spawn()?;
             Ok(0)
         } else {
             Ok(42)
@@ -720,7 +762,7 @@ mod tests {
     async fn multi_redirect(ctx: &Context) -> Result<i64> {
         let count = MULTI_REDIR_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
         if count < 2 {
-            let _ = ctx.rpc::<i32>("dep", &()).spawn().await?;
+            let _ = ctx.rpc::<i32>("dep", &()).spawn()?;
         }
         Ok(count as i64)
     }
@@ -1219,7 +1261,7 @@ mod tests {
     #[resonate_sdk_macros::function]
     async fn unwrap_suspend(ctx: &Context) -> Result<i32> {
         // Simulates a user accidentally calling .unwrap() on a suspended rpc
-        let handle = ctx.rpc::<i32>("dep", &()).spawn().await?;
+        let handle = ctx.rpc::<i32>("dep", &()).spawn()?;
         let val: i32 = handle.await.unwrap();
         Ok(val)
     }
@@ -1259,6 +1301,56 @@ mod tests {
     #[resonate_sdk_macros::function]
     async fn plain_panic(_ctx: &Context) -> Result<i32> {
         panic!("something went wrong");
+    }
+
+    /// Spawns a background child creation, then panics before yielding — so the
+    /// child task is queued but never polled when the panic unwinds.
+    #[resonate_sdk_macros::function]
+    async fn spawn_then_panic(ctx: &Context) -> Result<i32> {
+        let _ = ctx.rpc::<i32>("child", &()).spawn()?;
+        panic!("boom");
+    }
+
+    #[tokio::test]
+    async fn panic_aborts_inflight_child_creation() {
+        let harness = TestHarness::new();
+        let root = make_root_promise("p1", "spawn_then_panic", serde_json::json!(null));
+        harness.add_task("task1", root, vec![]).await;
+
+        let mut registry = Registry::new();
+        registry.register(spawn_then_panic).unwrap();
+
+        let core = test_core(
+            harness.build_sender(),
+            noop_codec(),
+            Arc::new(RwLock::new(registry)),
+        );
+        let result = core.on_message("task1", 0).await;
+        assert!(result.is_err(), "panic should surface as an error");
+
+        // Give any *non-aborted* detached task a chance to run and hit the
+        // network. On the current-thread test runtime, the panicking future
+        // never yields after spawning the child, so the child is only ever
+        // queued — abort-on-drop must cancel it before it sends its create.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let requests = harness.sent_requests_json().await;
+        assert!(
+            !requests.iter().any(|r| {
+                r["kind"] == "promise.create"
+                    && r["id"].as_str().is_some_and(|id| id.starts_with("p1."))
+            }),
+            "child creation must not be sent after the parent panics — \
+             the spawned task should be aborted on Context drop"
+        );
+
+        // The parent task is still released for retry (existing behavior).
+        assert!(
+            requests.iter().any(|r| r["kind"] == "task.release"),
+            "task should be released after panic"
+        );
     }
 
     #[tokio::test]
@@ -1318,6 +1410,48 @@ mod tests {
             hb.stop_count(),
             1,
             "heartbeat should be stopped even after panic"
+        );
+    }
+
+    // ── Background creation failure → release ─────────────────────
+
+    #[resonate_sdk_macros::function]
+    async fn fire_and_forget_rpc(ctx: &Context) -> Result<i64> {
+        let _ = ctx.rpc::<i32>("dep", &()).spawn()?;
+        Ok(0)
+    }
+
+    #[tokio::test]
+    async fn failed_background_creation_releases_task() {
+        let harness = TestHarness::new();
+        let root = make_root_promise("p1", "fire_and_forget_rpc", serde_json::json!(null));
+        harness.add_task("task1", root, vec![]).await;
+        // The rpc's background promise.create fails; the handle is never
+        // awaited, so the error must surface at flush and release the task.
+        harness.set_fail_promise_create(true).await;
+
+        let mut registry = Registry::new();
+        registry.register(fire_and_forget_rpc).unwrap();
+
+        let core = test_core(
+            harness.build_sender(),
+            noop_codec(),
+            Arc::new(RwLock::new(registry)),
+        );
+        let result = core.on_message("task1", 0).await;
+        assert!(
+            result.is_err(),
+            "execution should fail when a background creation fails"
+        );
+
+        let requests = harness.sent_requests_json().await;
+        assert!(
+            requests.iter().any(|r| r["kind"] == "task.release"),
+            "task should be released after a background creation failure"
+        );
+        assert!(
+            !requests.iter().any(|r| r["kind"] == "task.fulfill"),
+            "task must not be fulfilled when a child creation was lost"
         );
     }
 

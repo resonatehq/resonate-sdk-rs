@@ -10,11 +10,6 @@ use std::collections::HashMap;
 ///
 /// On the wire, `data` is a base64-encoded JSON string (or undefined).
 /// Internally after decoding by the Codec, `data` holds the deserialized value.
-///
-/// Mirrors the TS type:
-/// ```ts
-/// type Value = { headers?: Record<string, string>; data?: any };
-/// ```
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Value {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,11 +33,6 @@ impl Value {
     /// Consume self and return the data field, defaulting to `serde_json::Value::Null` if absent.
     pub fn into_data_or_null(self) -> serde_json::Value {
         self.data.unwrap_or(serde_json::Value::Null)
-    }
-
-    /// Get headers, defaulting to empty map if absent.
-    pub fn headers_or_empty(&self) -> HashMap<String, String> {
-        self.headers.clone().unwrap_or_default()
     }
 
     /// Serialize any value into a `Value`.
@@ -93,11 +83,6 @@ impl<'de> Deserialize<'de> for Value {
 // =============================================================================
 
 /// The state of a durable promise.
-///
-/// Mirrors the TS type:
-/// ```ts
-/// state: "pending" | "resolved" | "rejected" | "rejected_canceled" | "rejected_timedout"
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PromiseState {
     #[serde(rename = "pending")]
@@ -113,15 +98,6 @@ pub enum PromiseState {
 }
 
 /// A durable promise record as stored by the server.
-///
-/// Mirrors the TS type:
-/// ```ts
-/// type PromiseRecord = {
-///   id: string; state: PromiseState; param: Value; value: Value;
-///   tags: Record<string, string>; timeoutAt: number;
-///   createdAt: number; settledAt?: number;
-/// };
-/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromiseRecord {
@@ -141,11 +117,6 @@ pub struct PromiseRecord {
 }
 
 /// The state of a task.
-///
-/// Mirrors the TS type:
-/// ```ts
-/// state: "pending" | "acquired" | "suspended" | "halted" | "fulfilled"
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
     #[serde(rename = "pending")]
@@ -161,18 +132,6 @@ pub enum TaskState {
 }
 
 /// A task record as returned by the server.
-///
-/// Mirrors the TS type:
-/// ```ts
-/// type TaskRecord = {
-///   id: string;
-///   state: "pending" | "acquired" | "suspended" | "halted" | "fulfilled";
-///   version: number;
-///   resumes: string[] | number | boolean;
-///   ttl?: number;
-///   pid?: string;
-/// };
-/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub id: String,
@@ -188,16 +147,6 @@ pub struct TaskRecord {
 }
 
 /// A schedule record as returned by the server.
-///
-/// Mirrors the TS type:
-/// ```ts
-/// type ScheduleRecord = {
-///   id: string; cron: string; promiseId: string;
-///   promiseTimeout: number; promiseParam: Value;
-///   promiseTags: Record<string, string>;
-///   createdAt: number; nextRunAt: number; lastRunAt?: number;
-/// };
-/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleRecord {
@@ -222,11 +171,6 @@ pub struct ScheduleRecord {
 // =============================================================================
 
 /// How to settle a durable promise.
-///
-/// Mirrors the TS type:
-/// ```ts
-/// state: "resolved" | "rejected" | "rejected_canceled"
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SettleState {
     #[serde(rename = "resolved")]
@@ -244,7 +188,6 @@ pub struct PromiseCreateReq {
     pub id: String,
     pub timeout_at: i64,
     pub param: Value,
-    // #[serde(default)]
     pub tags: HashMap<String, String>,
 }
 
@@ -254,10 +197,7 @@ impl PromiseCreateReq {
         Self {
             id: id.to_string(),
             timeout_at: 0,
-            param: Value {
-                headers: None,
-                data: None,
-            },
+            param: Value::default(),
             tags: HashMap::new(),
         }
     }
