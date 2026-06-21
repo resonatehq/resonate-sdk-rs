@@ -927,6 +927,11 @@ mod tests {
             .unwrap();
         assert_eq!(res.promise.id, "child");
         assert_eq!(res.promise.state, crate::types::PromiseState::Pending);
+
+        // The create was actually applied server-side, not just echoed back.
+        let stored = sender.promise_get("child").await.unwrap();
+        assert_eq!(stored.id, "child");
+        assert_eq!(stored.state, crate::types::PromiseState::Pending);
     }
 
     #[tokio::test]
@@ -1009,6 +1014,45 @@ mod tests {
         assert!(
             matches!(err, Error::ServerError { code: 409, .. }),
             "expected ServerError(409), got {err:?}"
+        );
+
+        // The fence must be a no-op: the child promise was never created.
+        let probe = sender.promise_get("child").await.unwrap_err();
+        assert!(
+            matches!(probe, Error::ServerError { code: 404, .. }),
+            "fenced-off create must not have written the promise, got {probe:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_fence_unknown_task_returns_not_found() {
+        let net = Arc::new(LocalNetwork::new(Some("pid1".into()), None));
+        let sender = test_sender(net);
+
+        // No task was ever created, so fencing against it must 404 — and apply
+        // nothing.
+        let err = sender
+            .task_fence_create(
+                "ghost-task",
+                0,
+                PromiseCreateReq {
+                    id: "child".into(),
+                    timeout_at: i64::MAX,
+                    param: Value::default(),
+                    tags: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ServerError { code: 404, .. }),
+            "expected ServerError(404), got {err:?}"
+        );
+
+        let probe = sender.promise_get("child").await.unwrap_err();
+        assert!(
+            matches!(probe, Error::ServerError { code: 404, .. }),
+            "fence against a missing task must not write the promise, got {probe:?}"
         );
     }
 
