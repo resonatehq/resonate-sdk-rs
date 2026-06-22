@@ -678,6 +678,39 @@ pub fn test_context_with_timeout(id: &str, timeout_at: i64, effects: Effects) ->
     )
 }
 
+/// Drive a workflow future the way `Core::execute_until_blocked_inner` does:
+/// race it against the context's suspend signal, then finalize into an Outcome.
+///
+/// A pending durable await now *parks* rather than returning `Err(Suspended)`,
+/// so awaiting one directly in a test would hang — use this helper instead.
+/// Panics if flush fails — use `try_run_workflow` for failure-path tests.
+pub async fn run_workflow<T, F>(ctx: &Context, fut: F) -> crate::types::Outcome<T>
+where
+    F: std::future::Future<Output = error::Result<T>>,
+{
+    try_run_workflow(ctx, fut)
+        .await
+        .expect("flush_local_work failed")
+}
+
+/// Like `run_workflow`, but surfaces flush errors instead of panicking.
+///
+/// The primitive both test-driver pairs build on: race the future against the
+/// suspend signal, collect todos, and apply the shared `finalize_outcome` rule —
+/// exactly what `Core::execute_until_blocked_inner` does.
+pub async fn try_run_workflow<T, F>(
+    ctx: &Context,
+    fut: F,
+) -> error::Result<crate::types::Outcome<T>>
+where
+    F: std::future::Future<Output = error::Result<T>>,
+{
+    // `None` ⇒ the future parked on suspension; `Some` ⇒ it ran to completion.
+    let result = crate::durable::race_suspend(fut, ctx.suspended()).await;
+    let remote_todos = ctx.collect_remote_todos().await?;
+    Ok(crate::durable::finalize_outcome(result, remote_todos))
+}
+
 /// Finalize a context into an Outcome after a workflow function has been called.
 /// Call this after running operations on the context to determine Done vs Suspended.
 /// Panics if flush fails — use `try_finalize_context` for failure-path tests.
@@ -692,15 +725,12 @@ pub async fn finalize_context<T>(
 
 /// Like `finalize_context`, but surfaces flush errors (e.g. a fire-and-forget
 /// promise creation that failed in the background) instead of panicking.
+///
+/// `result` is an already-obtained completion, so this is just `try_run_workflow`
+/// over a future that returns it immediately.
 pub async fn try_finalize_context<T>(
     ctx: &Context,
     result: error::Result<T>,
 ) -> error::Result<crate::types::Outcome<T>> {
-    let remote_todos = ctx.collect_remote_todos().await?;
-
-    Ok(if remote_todos.is_empty() {
-        crate::types::Outcome::Done(result)
-    } else {
-        crate::types::Outcome::Suspended { remote_todos }
-    })
+    try_run_workflow(ctx, async move { result }).await
 }

@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::codec::deserialize_error;
-use crate::durable::{Durable, ExecutionEnv};
+use crate::durable::{finalize_outcome, race_suspend, Durable, ExecutionEnv};
 use crate::effects::Effects;
 use crate::error::{Error, Result};
-use crate::futures::{DetachedHandle, DurableFuture, RemoteFuture};
+use crate::futures::{DetachedHandle, DurableFuture, HandleMsg, RemoteFuture};
 use crate::info::Info;
 use crate::sequencing::{CreationSequencer, CreationState};
 use crate::types::{
@@ -77,6 +77,9 @@ pub struct Context {
     spawned_handles: Arc<Mutex<Vec<SpawnedHandle>>>,
     sequencer: CreationSequencer,
     deps: Arc<crate::DependencyMap>,
+    /// Signalled when a durable await in this context can't make progress. The
+    /// driver racing this context's user future wakes on it and suspends.
+    suspend: Arc<tokio::sync::Notify>,
 }
 
 impl Context {
@@ -103,12 +106,30 @@ impl Context {
             spawned_handles: Arc::new(Mutex::new(Vec::new())),
             sequencer: CreationSequencer::new(),
             deps,
+            suspend: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Create a child context for a nested workflow.
+    /// Create a child context for a nested *inline* workflow (`ctx.run().await`).
+    /// The child gets its own suspend signal so the inline mini-driver can race
+    /// the child body, then hoist the child's todos to the parent.
     fn child(&self, id: &str, func_name: &str, timeout_at: i64) -> Context {
         self.child_seed().context(id, func_name, timeout_at)
+    }
+
+    /// Resolves when this context (or an inline child) has signalled suspension.
+    /// The driver races this against the user future.
+    pub(crate) fn suspended(&self) -> tokio::sync::futures::Notified<'_> {
+        self.suspend.notified()
+    }
+
+    /// Register `todos` as remote work this context waits on, signal the driver,
+    /// and park forever. A pending durable await calls this instead of returning
+    /// a sentinel error, so user code can't `match`/`unwrap` the suspension away.
+    async fn suspend_now<T>(&self, todos: impl IntoIterator<Item = String>) -> T {
+        self.remote_todos.lock().extend(todos);
+        self.suspend.notify_one();
+        std::future::pending().await
     }
 
     /// Create an Info for a child leaf function.
@@ -328,7 +349,7 @@ impl Context {
     ///
     /// // Create and get handle (to await later); the ID — available once the
     /// // promise exists on the server — can be handed to an external system
-    /// let handle: RemoteFuture<String> = ctx.promise::<String>().create()?;
+    /// let handle: RemoteFuture<'_, String> = ctx.promise::<String>().create()?;
     /// let id = handle.id().await?;
     /// let result = handle.await?;
     /// ```
@@ -530,7 +551,11 @@ struct ChildSeed {
 
 impl ChildSeed {
     /// Build a child `Context` (the single child-context constructor —
-    /// `Context::child` delegates here).
+    /// `Context::child` and the spawn path delegate here).
+    ///
+    /// Every child gets a *fresh* suspend signal: it runs under its own driver
+    /// that races the child body against that signal and reports suspension to
+    /// the parent.
     fn context(&self, id: &str, func_name: &str, timeout_at: i64) -> Context {
         Context {
             id: id.to_string(),
@@ -546,6 +571,7 @@ impl ChildSeed {
             spawned_handles: Arc::new(Mutex::new(Vec::new())),
             sequencer: CreationSequencer::new(),
             deps: Arc::clone(&self.deps),
+            suspend: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -633,7 +659,7 @@ where
     /// the handle is awaited (and at flush for fire-and-forget handles).
     /// Requires `D: Send + 'static` because the function is moved into the
     /// spawned task.
-    pub fn spawn(self) -> Result<DurableFuture<T>>
+    pub fn spawn(self) -> Result<DurableFuture<'ctx, T>>
     where
         D: Durable<Args, T> + Send + 'static,
         Args: Serialize + DeserializeOwned + Send + 'static,
@@ -665,11 +691,11 @@ where
                     PromiseState::Resolved => {
                         return match record.value.into_decoded::<T>() {
                             Ok(val) => {
-                                let _ = tx.send(Ok(val));
+                                let _ = tx.send(HandleMsg::Done(Ok(val)));
                                 Outcome::Done(Ok(()))
                             }
                             Err(e) => {
-                                let _ = tx.send(Err(duplicate_error(&e)));
+                                let _ = tx.send(HandleMsg::Done(Err(duplicate_error(&e))));
                                 Outcome::Done(Err(e))
                             }
                         };
@@ -677,7 +703,9 @@ where
                     PromiseState::Rejected
                     | PromiseState::RejectedCanceled
                     | PromiseState::RejectedTimedout => {
-                        let _ = tx.send(Err(deserialize_error(record.value.into_data_or_null())));
+                        let _ = tx.send(HandleMsg::Done(Err(deserialize_error(
+                            record.value.into_data_or_null(),
+                        ))));
                         return Outcome::Done(Ok(()));
                     }
                     PromiseState::Pending => {}
@@ -690,9 +718,14 @@ where
                     DurableKind::Function => ExecutionEnv::Function(&info),
                     DurableKind::Workflow => ExecutionEnv::Workflow(&child_ctx),
                 };
-                let result = func.execute(env, args).await;
 
-                // Collect remote todos (workflows only)
+                // Race the child's user future against its own suspend signal:
+                // without it a parked leaf would hang this background task forever.
+                let result: Option<Result<T>> =
+                    race_suspend(func.execute(env, args), env.suspended()).await;
+
+                // Collect remote todos (workflows only), even on suspend, to
+                // gather what the child waits on and flush grandchildren.
                 let mut child_remote = Vec::new();
                 if D::KIND == DurableKind::Workflow {
                     match child_ctx.collect_remote_todos().await {
@@ -700,42 +733,34 @@ where
                         Err(e) => {
                             // A grandchild's background creation failed — do NOT
                             // settle this child's promise; fail the whole task.
-                            let _ = tx.send(Err(duplicate_error(&e)));
+                            let _ = tx.send(HandleMsg::Done(Err(duplicate_error(&e))));
                             return Outcome::Done(Err(e));
                         }
                     }
                 }
 
-                // Explicit suspension handling: if the workflow suspended
-                // (e.g. a pending ctx.rpc().await), handle it directly
-                // instead of letting it fall through as an application error.
-                if matches!(&result, Err(Error::Suspended)) {
-                    debug_assert!(
-                        !child_remote.is_empty(),
-                        "Suspended error but no remote todos — this is a bug"
-                    );
-                    let _ = tx.send(Err(Error::Suspended));
-                    return Outcome::Suspended {
-                        remote_todos: child_remote,
-                    };
-                }
-
-                // Spawned sub-workflows may have remote todos even if the
-                // main function completed successfully.
-                if child_remote.is_empty() {
-                    let _ = effects.settle_promise(&task_id, &result).await;
-                    let _ = tx.send(result);
-                    Outcome::Done(Ok(()))
-                } else {
-                    let _ = tx.send(Err(Error::Suspended));
-                    Outcome::Suspended {
-                        remote_todos: child_remote,
+                // Only a clean completion with no outstanding todos settles the
+                // promise; otherwise the child suspends. See `finalize_outcome`.
+                match finalize_outcome(result, child_remote) {
+                    Outcome::Done(result) => {
+                        let _ = effects.settle_promise(&task_id, &result).await;
+                        let _ = tx.send(HandleMsg::Done(result));
+                        Outcome::Done(Ok(()))
+                    }
+                    Outcome::Suspended { remote_todos } => {
+                        let _ = tx.send(HandleMsg::Suspended);
+                        Outcome::Suspended { remote_todos }
                     }
                 }
             }
         });
 
-        Ok(DurableFuture::pending(child_id, rx, created_rx))
+        Ok(DurableFuture::pending(
+            child_id,
+            rx,
+            created_rx,
+            Arc::clone(&ctx.suspend),
+        ))
     }
 }
 
@@ -796,23 +821,23 @@ where
                 promise_id = %child_id,
                 "promise_execution_await"
             );
-            let result = func.execute(env, args).await;
+            // Mini-driver: an inline child runs in this same tokio task but with
+            // its own context and suspend signal, so we race its body against
+            // *its* signal. `None` ⇒ suspended; `Some` ⇒ ran to completion.
+            let result: Option<Result<T>> =
+                race_suspend(func.execute(env, args), env.suspended()).await;
             let child_remotes = env.collect_remote_todos().await?;
 
-            // FINALIZE. A child suspends iff it left unresolved remote
-            // dependencies — independent of `result`: it can return `Ok` while
-            // still having spawned remote work it never awaited, and that work
-            // is what it now waits on. So `child_remote`, not `result`, decides.
-            // Mirrors `Core::execute_until_blocked_inner`, except a child hoists
-            // its todos to the parent and still hands `result` back to the
-            // caller (the root executor returns a `Status` instead).
-            if child_remotes.is_empty() {
-                debug_assert!(!matches!(&result, Err(Error::Suspended)));
-                ctx.effects.settle_promise(&child_id, &result).await?;
-            } else {
-                ctx.remote_todos.lock().extend(child_remotes);
+            // FINALIZE (see `finalize_outcome`). Mirrors
+            // `Core::execute_until_blocked_inner`, except a child hoists its
+            // todos to the parent and parks, signalling the *parent's* driver.
+            match finalize_outcome(result, child_remotes) {
+                Outcome::Done(result) => {
+                    ctx.effects.settle_promise(&child_id, &result).await?;
+                    result
+                }
+                Outcome::Suspended { remote_todos } => ctx.suspend_now(remote_todos).await,
             }
-            result
         })
     }
 }
@@ -824,9 +849,9 @@ where
 /// A lazy remote execution task. Created by `ctx.rpc()`.
 ///
 /// Implements `IntoFuture` so `.await` works directly. On `Pending` state,
-/// awaiting pushes to `remote_todos` and returns `Err(Suspended)`. Nothing
-/// happens until a terminal op runs: `.spawn()` starts promise creation on a
-/// background task and returns a `RemoteFuture` handle.
+/// awaiting registers a remote todo and parks (suspending the workflow).
+/// Nothing happens until a terminal op runs: `.spawn()` starts promise creation
+/// on a background task and returns a `RemoteFuture` handle.
 pub struct RpcTask<'ctx, T> {
     child_id: String,
     ctx: &'ctx Context,
@@ -857,7 +882,7 @@ impl<'ctx, T> RpcTask<'ctx, T> {
     /// Synchronous: promise creation happens on a background task. `Err` only
     /// for argument serialization failures; creation errors surface when the
     /// handle is awaited (and at flush for fire-and-forget handles).
-    pub fn spawn(self) -> Result<RemoteFuture<T>>
+    pub fn spawn(self) -> Result<RemoteFuture<'ctx, T>>
     where
         T: DeserializeOwned + Send + 'static,
     {
@@ -903,12 +928,12 @@ fn spawn_sequenced<T, F, Fut>(
     req: PromiseCreateReq,
     on_created: F,
 ) -> (
-    tokio::sync::oneshot::Receiver<Result<T>>,
+    tokio::sync::oneshot::Receiver<HandleMsg<T>>,
     tokio::sync::watch::Receiver<CreationState>,
 )
 where
     T: Send + 'static,
-    F: FnOnce(PromiseRecord, tokio::sync::oneshot::Sender<Result<T>>) -> Fut + Send + 'static,
+    F: FnOnce(PromiseRecord, tokio::sync::oneshot::Sender<HandleMsg<T>>) -> Fut + Send + 'static,
     Fut: Future<Output = Outcome<()>> + Send,
 {
     let slot = ctx.sequencer.claim_slot();
@@ -920,7 +945,7 @@ where
         match slot.create(&effects, req).await {
             Ok(record) => on_created(record, tx).await,
             Err(e) => {
-                let _ = tx.send(Err(duplicate_error(&e)));
+                let _ = tx.send(HandleMsg::Done(Err(duplicate_error(&e))));
                 Outcome::Done(Err(e))
             }
         }
@@ -942,7 +967,11 @@ where
 /// otherwise reports the pending child as a remote todo via its `Outcome` —
 /// collected by `collect_remote_todos`, which every caller runs at flush, so a
 /// fire-and-forget spawn is never lost.
-fn spawn_remote<T>(ctx: &Context, child_id: String, req: PromiseCreateReq) -> RemoteFuture<T>
+fn spawn_remote<'ctx, T>(
+    ctx: &'ctx Context,
+    child_id: String,
+    req: PromiseCreateReq,
+) -> RemoteFuture<'ctx, T>
 where
     T: DeserializeOwned + Send + 'static,
 {
@@ -952,7 +981,7 @@ where
             match record.as_result::<T>() {
                 // Replay short-circuit: already settled, deliver the value/error.
                 Some(result) => {
-                    let _ = tx.send(result);
+                    let _ = tx.send(HandleMsg::Done(result));
                     Outcome::Done(Ok(()))
                 }
                 // Pending: suspend the awaiter, report the remote todo via flush.
@@ -962,7 +991,7 @@ where
                         promise_id = %task_id,
                         "promise_execution_block"
                     );
-                    let _ = tx.send(Err(Error::Suspended));
+                    let _ = tx.send(HandleMsg::Suspended);
                     Outcome::Suspended {
                         remote_todos: vec![task_id],
                     }
@@ -971,7 +1000,7 @@ where
         }
     });
 
-    RemoteFuture::pending(child_id, rx, created_rx)
+    RemoteFuture::pending(child_id, rx, created_rx, Arc::clone(&ctx.suspend))
 }
 
 /// Shared `.await` body for `rpc`, `sleep`, and `promise`: sequenced creation,
@@ -1000,8 +1029,7 @@ where
             promise_id = %child_id,
             "promise_execution_block"
         );
-        ctx.remote_todos.lock().push(child_id);
-        Err(Error::Suspended)
+        ctx.suspend_now([child_id]).await
     })
 }
 
@@ -1015,10 +1043,10 @@ where
 /// (webhook, human approval, cross-process signal, etc.).
 ///
 /// Implements `IntoFuture` so `.await` works directly. On `Pending` state,
-/// awaiting pushes to `remote_todos` and returns `Err(Suspended)`, just like
-/// RPC. `.create()` starts promise creation on a background task and returns a
-/// `RemoteFuture` handle; use `handle.id()` to obtain the promise ID once the
-/// promise exists on the server.
+/// awaiting registers a remote todo and parks, just like RPC. `.create()`
+/// starts promise creation on a background task and returns a `RemoteFuture`
+/// handle; use `handle.id()` to obtain the promise ID once the promise exists
+/// on the server.
 pub struct PromiseTask<'ctx, T> {
     child_id: String,
     ctx: &'ctx Context,
@@ -1044,7 +1072,7 @@ impl<'ctx, T> PromiseTask<'ctx, T> {
     /// Synchronous: creation happens on a background task. Use `handle.id()`
     /// to get the promise ID once creation has succeeded (hand it to the
     /// external resolver), then await the handle for the resolution.
-    pub fn create(self) -> Result<RemoteFuture<T>>
+    pub fn create(self) -> Result<RemoteFuture<'ctx, T>>
     where
         T: DeserializeOwned + Send + 'static,
     {
@@ -1077,9 +1105,9 @@ where
 /// A lazy timer task. Created by `ctx.sleep()`.
 ///
 /// Implements `IntoFuture` so `.await` works directly. On `Pending` state,
-/// awaiting pushes to `remote_todos` and returns `Err(Suspended)`, just like
-/// RPC. `.spawn()` starts the timer's promise creation on a background task
-/// and returns a `RemoteFuture` handle.
+/// awaiting registers a remote todo and parks, just like RPC. `.spawn()` starts
+/// the timer's promise creation on a background task and returns a
+/// `RemoteFuture` handle.
 pub struct SleepTask<'ctx> {
     child_id: String,
     ctx: &'ctx Context,
@@ -1092,7 +1120,7 @@ impl<'ctx> SleepTask<'ctx> {
     /// Synchronous: promise creation happens on a background task. `Result`
     /// is kept for API consistency with the other spawn-like methods; this
     /// method has no synchronous failure mode today.
-    pub fn spawn(self) -> Result<RemoteFuture<()>> {
+    pub fn spawn(self) -> Result<RemoteFuture<'ctx, ()>> {
         let SleepTask {
             child_id, ctx, req, ..
         } = self;
@@ -1418,7 +1446,7 @@ mod tests {
 
         // First execution: local bar runs, remote suspends
         let local_future = ctx.run(Bar, ()).spawn().unwrap();
-        let _remote_future: RemoteFuture<i32> = ctx.rpc::<i32>("bar", &()).spawn().unwrap();
+        let _remote_future: RemoteFuture<'_, i32> = ctx.rpc::<i32>("bar", &()).spawn().unwrap();
         let local_val: i32 = local_future.await.unwrap();
         let outcome = finalize_context(&ctx, Ok(local_val)).await;
 
@@ -1438,7 +1466,7 @@ mod tests {
         let ctx2 = test_context("root", effects2);
 
         let local_future2 = ctx2.run(Bar, ()).spawn().unwrap();
-        let remote_future2: RemoteFuture<i32> = ctx2.rpc::<i32>("bar", &()).spawn().unwrap();
+        let remote_future2: RemoteFuture<'_, i32> = ctx2.rpc::<i32>("bar", &()).spawn().unwrap();
         let local_val2: i32 = local_future2.await.unwrap();
         let remote_val2: i32 = remote_future2.await.unwrap();
         let outcome2 = finalize_context(&ctx2, Ok(local_val2 + remote_val2)).await;
@@ -1593,13 +1621,8 @@ mod tests {
         let ctx = test_context("foo", effects);
 
         // First execution: child suspends on rpc("remoteFunc")
-        let result: crate::error::Result<i32> = ctx.run(ChildWorkflow, ()).await;
-        let workflow_result = match result {
-            Ok(v) => Ok(v + 1),
-            Err(Error::Suspended) => Err(Error::Suspended),
-            Err(e) => Err(e),
-        };
-        let outcome = finalize_context(&ctx, workflow_result).await;
+        let outcome: Outcome<i32> =
+            run_workflow(&ctx, async { ctx.run(ChildWorkflow, ()).await.map(|v| v + 1) }).await;
 
         let remote_id = match &outcome {
             Outcome::Suspended { remote_todos } => {
@@ -1616,12 +1639,8 @@ mod tests {
         let effects2 = harness.build_effects(vec![resolved_promise(&remote_id, 21_i32)]);
         let ctx2 = test_context("foo", effects2);
 
-        let result2: crate::error::Result<i32> = ctx2.run(ChildWorkflow, ()).await;
-        let workflow_result2 = match result2 {
-            Ok(v) => Ok(v + 1),
-            Err(e) => Err(e),
-        };
-        let outcome2 = finalize_context(&ctx2, workflow_result2).await;
+        let outcome2: Outcome<i32> =
+            run_workflow(&ctx2, async { ctx2.run(ChildWorkflow, ()).await.map(|v| v + 1) }).await;
 
         match outcome2 {
             Outcome::Done(Ok(v)) => assert_eq!(v, 43),
@@ -1693,14 +1712,55 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("main", effects);
 
-        let result: crate::error::Result<i32> = ctx.rpc("remoteFunc", ()).await;
-        let outcome = finalize_context(&ctx, result).await;
+        let outcome: Outcome<i32> =
+            run_workflow(&ctx, async { ctx.rpc("remoteFunc", ()).await }).await;
 
         match outcome {
             Outcome::Suspended { remote_todos } => {
                 assert_eq!(remote_todos.len(), 1);
             }
             other => panic!("expected Suspended with 1 entry, got {:?}", other),
+        }
+    }
+
+    // ── Suspension can't be swallowed by user code ─────────────────
+    // A pending durable await never hands a value (or error) back to user code,
+    // so `match`/`unwrap` can't intercept it: the await parks and suspends.
+
+    #[tokio::test]
+    async fn user_cannot_swallow_suspension_via_match() {
+        let harness = TestHarness::new();
+        let effects = harness.build_effects(vec![]);
+        let ctx = test_context("main", effects);
+
+        // The await parks before either arm runs, so the Err branch is unreachable.
+        let outcome: Outcome<i32> = run_workflow(&ctx, async {
+            match ctx.rpc::<i32>("remoteFunc", ()).await {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(-1), // never reached
+            }
+        })
+        .await;
+
+        match outcome {
+            Outcome::Suspended { remote_todos } => assert_eq!(remote_todos.len(), 1),
+            other => panic!("expected Suspended, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_unwrap_on_pending_rpc_suspends_cleanly() {
+        let harness = TestHarness::new();
+        let effects = harness.build_effects(vec![]);
+        let ctx = test_context("main", effects);
+
+        // `.unwrap()` never runs: the await parks first, so the workflow suspends.
+        let outcome: Outcome<i32> =
+            run_workflow(&ctx, async { Ok(ctx.rpc::<i32>("remoteFunc", ()).await.unwrap()) }).await;
+
+        match outcome {
+            Outcome::Suspended { remote_todos } => assert_eq!(remote_todos.len(), 1),
+            other => panic!("expected Suspended, got {:?}", other),
         }
     }
 
@@ -1730,14 +1790,12 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("main", effects);
 
-        let local_val: i32 = ctx.run(Add, (1, 2)).await.unwrap();
-        let remote_result: crate::error::Result<i32> = ctx.rpc("remoteFunc", ()).await;
-        let workflow_result = match remote_result {
-            Ok(v) => Ok(local_val + v),
-            Err(Error::Suspended) => Err(Error::Suspended),
-            Err(e) => Err(e),
-        };
-        let outcome = finalize_context(&ctx, workflow_result).await;
+        let outcome: Outcome<i32> = run_workflow(&ctx, async {
+            let local_val: i32 = ctx.run(Add, (1, 2)).await.unwrap();
+            let v: i32 = ctx.rpc("remoteFunc", ()).await?;
+            Ok(local_val + v)
+        })
+        .await;
 
         match outcome {
             Outcome::Suspended { remote_todos } => {
@@ -1902,7 +1960,7 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        let _: crate::error::Result<i32> = ctx.rpc("remote", ()).await;
+        let _: Outcome<i32> = run_workflow(&ctx, async { ctx.rpc("remote", ()).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create_req = requests.iter().find(|r| r["kind"] == "promise.create");
@@ -1969,7 +2027,7 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        let _: crate::error::Result<i32> = ctx.rpc("hello", ()).await;
+        let _: Outcome<i32> = run_workflow(&ctx, async { ctx.rpc("hello", ()).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -1994,7 +2052,7 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        let _: crate::error::Result<String> = ctx.rpc("my_func", 42i32).await;
+        let _: Outcome<String> = run_workflow(&ctx, async { ctx.rpc("my_func", 42i32).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2019,9 +2077,15 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        // Await the handle so the background creation completes before
-        // asserting on the sent requests (Err(Suspended) is expected).
-        let _ = ctx.rpc::<i32>("greet", &"world").spawn().unwrap().await;
+        // Resolve the handle's id (not .await, which would park forever) so the
+        // background creation reaches the server before asserting on requests.
+        let _ = ctx
+            .rpc::<i32>("greet", &"world")
+            .spawn()
+            .unwrap()
+            .id()
+            .await
+            .unwrap();
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2045,7 +2109,7 @@ mod tests {
             std::sync::Arc::new(|target: Option<&str>| target.unwrap_or("default").to_string());
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        let _: crate::error::Result<i32> = ctx.rpc("bare_name", ()).await;
+        let _: Outcome<i32> = run_workflow(&ctx, async { ctx.rpc("bare_name", ()).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2071,10 +2135,11 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        // First rpc call
-        let _: crate::error::Result<i32> = ctx.rpc("func_a", ()).await;
-        // Second rpc call — same context, target_resolver should still work
-        let _: crate::error::Result<i32> = ctx.rpc("func_b", ()).await;
+        // Both promise.creates must fire. A bare pending await parks forever, so
+        // the second would never run — use .spawn() (eager create) for both.
+        let _a = ctx.rpc::<i32>("func_a", &()).spawn().unwrap();
+        let _b = ctx.rpc::<i32>("func_b", &()).spawn().unwrap();
+        let _: Outcome<()> = run_workflow(&ctx, async { Ok(()) }).await;
 
         let requests = harness.sent_requests_json().await;
         let creates: Vec<_> = requests
@@ -2111,10 +2176,12 @@ mod tests {
         let ctx = test_context_with_match("root", effects, target_resolver);
 
         // Explicit .target() with a URL — should be kept as-is
-        let _: crate::error::Result<i32> = ctx
-            .rpc("some_func", ())
-            .target("http://other-host:8001/workers/hello")
-            .await;
+        let _: Outcome<i32> = run_workflow(&ctx, async {
+            ctx.rpc("some_func", ())
+                .target("http://other-host:8001/workers/hello")
+                .await
+        })
+        .await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2145,13 +2212,20 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
+        // Use .spawn() for both so both creates fire (a bare await would park).
         // Bare name target override — should be rewritten
-        let _: crate::error::Result<i32> = ctx.rpc("func_a", ()).target("workers").await;
+        let _a = ctx
+            .rpc::<i32>("func_a", &())
+            .target("workers")
+            .spawn()
+            .unwrap();
         // URL target override — should NOT be rewritten
-        let _: crate::error::Result<i32> = ctx
-            .rpc("func_b", ())
+        let _b = ctx
+            .rpc::<i32>("func_b", &())
             .target("https://remote.example.com/workers/greet")
-            .await;
+            .spawn()
+            .unwrap();
+        let _: Outcome<()> = run_workflow(&ctx, async { Ok(()) }).await;
 
         let requests = harness.sent_requests_json().await;
         let creates: Vec<_> = requests
@@ -2211,8 +2285,10 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        let _: crate::error::Result<i32> =
-            ctx.rpc::<i32>("my_func", &()).target("custom-target").await;
+        let _: Outcome<i32> = run_workflow(&ctx, async {
+            ctx.rpc::<i32>("my_func", &()).target("custom-target").await
+        })
+        .await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2237,7 +2313,8 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        let _: crate::error::Result<i32> = ctx.rpc::<i32>("my_func", &()).await;
+        let _: Outcome<i32> =
+            run_workflow(&ctx, async { ctx.rpc::<i32>("my_func", &()).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2268,10 +2345,12 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        let _: crate::error::Result<i32> = ctx
-            .rpc::<i32>("my_func", &())
-            .target("https://remote:9000/workers/foo")
-            .await;
+        let _: Outcome<i32> = run_workflow(&ctx, async {
+            ctx.rpc::<i32>("my_func", &())
+                .target("https://remote:9000/workers/foo")
+                .await
+        })
+        .await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2296,14 +2375,16 @@ mod tests {
             });
         let ctx = test_context_with_match("root", effects, target_resolver);
 
-        // Await the handle so the background creation completes before
-        // asserting on the sent requests (Err(Suspended) is expected).
+        // Resolve the handle's id (not .await, which would park forever) so the
+        // background creation reaches the server before asserting on requests.
         let _ = ctx
             .rpc::<i32>("my_func", &())
             .target("override-target")
             .spawn()
             .unwrap()
-            .await;
+            .id()
+            .await
+            .unwrap();
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2474,7 +2555,7 @@ mod tests {
         let parent_timeout = now + 5_000;
         let ctx = test_context_with_timeout("root", parent_timeout, effects);
 
-        let _: crate::error::Result<i32> = ctx.rpc("remote_func", ()).await;
+        let _: Outcome<i32> = run_workflow(&ctx, async { ctx.rpc("remote_func", ()).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2524,9 +2605,15 @@ mod tests {
         let parent_timeout = now + 5_000;
         let ctx = test_context_with_timeout("root", parent_timeout, effects);
 
-        // Await the handle so the background creation completes before
-        // asserting on the sent requests (Err(Suspended) is expected).
-        let _ = ctx.rpc::<i32>("remote", &()).spawn().unwrap().await;
+        // Resolve the handle's id (not .await, which would park forever) so the
+        // background creation reaches the server before asserting on requests.
+        let _ = ctx
+            .rpc::<i32>("remote", &())
+            .spawn()
+            .unwrap()
+            .id()
+            .await
+            .unwrap();
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2607,8 +2694,10 @@ mod tests {
         let ctx = test_context_with_timeout("root", parent_timeout, effects);
 
         let child_timeout = std::time::Duration::from_secs(10);
-        let _: crate::error::Result<i32> =
-            ctx.rpc::<i32>("remote", &()).timeout(child_timeout).await;
+        let _: Outcome<i32> = run_workflow(&ctx, async {
+            ctx.rpc::<i32>("remote", &()).timeout(child_timeout).await
+        })
+        .await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2636,14 +2725,16 @@ mod tests {
         let ctx = test_context_with_timeout("root", parent_timeout, effects);
 
         let child_timeout = std::time::Duration::from_secs(60);
-        // Await the handle so the background creation completes before
-        // asserting on the sent requests (Err(Suspended) is expected).
+        // Resolve the handle's id (not .await, which would park forever) so the
+        // background creation reaches the server before asserting on requests.
         let _ = ctx
             .rpc::<i32>("remote", &())
             .timeout(child_timeout)
             .spawn()
             .unwrap()
-            .await;
+            .id()
+            .await
+            .unwrap();
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2698,10 +2789,8 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        let result = ctx.sleep(Duration::from_secs(60)).await;
-        assert!(matches!(result, Err(Error::Suspended)));
-
-        let outcome = finalize_context::<()>(&ctx, Err(Error::Suspended)).await;
+        let outcome: Outcome<()> =
+            run_workflow(&ctx, async { ctx.sleep(Duration::from_secs(60)).await }).await;
         match &outcome {
             Outcome::Suspended { remote_todos } => {
                 assert_eq!(remote_todos.len(), 1);
@@ -2716,7 +2805,8 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        let _ = ctx.sleep(Duration::from_secs(60)).await;
+        let _: Outcome<()> =
+            run_workflow(&ctx, async { ctx.sleep(Duration::from_secs(60)).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2745,7 +2835,8 @@ mod tests {
         let parent_timeout = now + 120_000; // 2 minutes
         let ctx = test_context_with_timeout("root", parent_timeout, effects);
 
-        let _ = ctx.sleep(Duration::from_secs(60)).await;
+        let _: Outcome<()> =
+            run_workflow(&ctx, async { ctx.sleep(Duration::from_secs(60)).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2773,7 +2864,8 @@ mod tests {
         let ctx = test_context_with_timeout("root", parent_timeout, effects);
 
         // Request 60 seconds sleep, but parent only has 5s left
-        let _ = ctx.sleep(Duration::from_secs(60)).await;
+        let _: Outcome<()> =
+            run_workflow(&ctx, async { ctx.sleep(Duration::from_secs(60)).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2838,7 +2930,8 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        let _ = ctx.sleep(Duration::from_secs(10)).await;
+        let _: Outcome<()> =
+            run_workflow(&ctx, async { ctx.sleep(Duration::from_secs(10)).await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2863,8 +2956,8 @@ mod tests {
         let ctx = test_context("root", effects);
 
         // First execution: sleep suspends
-        let result = ctx.sleep(Duration::from_secs(30)).await;
-        let outcome = finalize_context(&ctx, result).await;
+        let outcome: Outcome<()> =
+            run_workflow(&ctx, async { ctx.sleep(Duration::from_secs(30)).await }).await;
 
         let sleep_id = match &outcome {
             Outcome::Suspended { remote_todos } => {
@@ -2901,10 +2994,8 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        let result = ctx.promise::<String>().await;
-        assert!(matches!(result, Err(Error::Suspended)));
-
-        let outcome = finalize_context::<()>(&ctx, Err(Error::Suspended)).await;
+        let outcome: Outcome<String> =
+            run_workflow(&ctx, async { ctx.promise::<String>().await }).await;
         match &outcome {
             Outcome::Suspended { remote_todos } => {
                 assert_eq!(remote_todos.len(), 1);
@@ -2919,7 +3010,8 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        let _ = ctx.promise::<String>().await;
+        let _: Outcome<String> =
+            run_workflow(&ctx, async { ctx.promise::<String>().await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2945,7 +3037,8 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        let _ = ctx.promise::<String>().await;
+        let _: Outcome<String> =
+            run_workflow(&ctx, async { ctx.promise::<String>().await }).await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2970,10 +3063,12 @@ mod tests {
         let parent_timeout = now + 300_000; // 5 minutes
         let ctx = test_context_with_timeout("root", parent_timeout, effects);
 
-        let _ = ctx
-            .promise::<String>()
-            .timeout(Duration::from_secs(120))
-            .await;
+        let _: Outcome<String> = run_workflow(&ctx, async {
+            ctx.promise::<String>()
+                .timeout(Duration::from_secs(120))
+                .await
+        })
+        .await;
 
         let requests = harness.sent_requests_json().await;
         let create = requests
@@ -2999,9 +3094,12 @@ mod tests {
         let ctx = test_context("root", effects);
 
         let handle = ctx.promise::<String>().create().unwrap();
-        // Pending promise should suspend when awaited
-        let err = handle.await.unwrap_err();
-        assert!(matches!(err, Error::Suspended));
+        // Awaiting a pending promise parks and suspends with it as a todo.
+        let outcome: Outcome<String> = run_workflow(&ctx, async { handle.await }).await;
+        match outcome {
+            Outcome::Suspended { remote_todos } => assert_eq!(remote_todos.len(), 1),
+            other => panic!("expected Suspended, got {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -3089,11 +3187,12 @@ mod tests {
         let h2 = ctx.rpc::<i32>("c", &()).spawn().unwrap();
 
         // All handles resolve (no hang): the first with the creation error,
-        // the successors with the sequence-aborted error.
+        // the successors with the sequence-aborted error. None park, because a
+        // creation failure delivers an error, not a suspension.
         let e0 = h0.await.unwrap_err();
         assert!(
-            !matches!(e0, Error::Suspended),
-            "first handle should fail, got: {e0}"
+            matches!(e0, Error::Application { .. }),
+            "first handle should fail with the creation error, got: {e0}"
         );
         let e1 = h1.await.unwrap_err();
         assert!(matches!(e1, Error::Application { .. }), "got: {e1}");
@@ -3145,10 +3244,9 @@ mod tests {
         let ctx = test_context("root", effects);
 
         let handle = ctx.rpc::<i32>("remote", &()).spawn().unwrap();
-        let err = handle.await.unwrap_err();
-        assert!(matches!(err, Error::Suspended), "got: {err}");
-
-        let outcome = finalize_context(&ctx, Err::<i32, _>(Error::Suspended)).await;
+        // Awaiting a still-pending spawned handle parks and signals suspension;
+        // flush then collects the spawned remote's todo.
+        let outcome: Outcome<i32> = run_workflow(&ctx, async { handle.await }).await;
         match &outcome {
             Outcome::Suspended { remote_todos } => {
                 assert_eq!(remote_todos, &["root.0".to_string()]);

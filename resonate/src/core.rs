@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::codec::Codec;
 use crate::context::{Context, TargetResolver};
-use crate::durable::ExecutionEnv;
+use crate::durable::{finalize_outcome, race_suspend, ExecutionEnv};
 use crate::effects::Effects;
 use crate::error::{Error, Result};
 use crate::heartbeat::Heartbeat;
@@ -240,30 +240,28 @@ impl Core {
                 }
             };
 
-            let result =
-                Self::run_catching_panics(task_id, (func)(env, task_data.args.clone())).await?;
+            // Race the user future against the suspend signal (see `race_suspend`).
+            // `None` ⇒ it parked on suspension; `Some(r)` ⇒ it ran to completion.
+            // The `?` propagates only a panic (releasing the task); the inner
+            // application result carries through to `finalize_outcome`.
+            let result: Option<Result<serde_json::Value>> = match race_suspend(
+                Self::run_catching_panics(task_id, (func)(env, task_data.args.clone())),
+                env.suspended(),
+            )
+            .await
+            {
+                Some(r) => Some(r?),
+                None => None,
+            };
 
             // A flush error (e.g. a fire-and-forget promise creation that failed in the background)
             // fails the whole execution so the task is released and retried.
             let remote_todos = env.collect_remote_todos().await?;
 
-            // 5. FINALIZE
-            //
-            // A function suspends iff it left unresolved remote dependencies.
-            // This is independent of `result`: a function can return `Ok` while
-            // still having spawned remote work it never awaited; that work is
-            // what it now waits on. So `remote_todos`, not `result`, decides
-            // whether we finished or suspended.
-            let outcome = if remote_todos.is_empty() {
-                // A `Suspended` sentinel here means a `?`-propagated suspension
-                // left no remote todos behind, a bug, since something must
-                // have been registered for us to wait on. Mirrors the invariant
-                // enforced for child contexts in `Context::finalize`.
-                debug_assert!(!matches!(&result, Err(Error::Suspended)));
-                Outcome::Done(result)
-            } else {
-                Outcome::Suspended { remote_todos }
-            };
+            // 5. FINALIZE. A function suspends iff it parked OR left unresolved
+            // remote dependencies (spawned work it never awaited) — `remote_todos`,
+            // not `result`, decides. See `finalize_outcome`.
+            let outcome = finalize_outcome(result, remote_todos);
 
             match outcome {
                 Outcome::Done(result) => {
@@ -308,10 +306,8 @@ impl Core {
 
     /// Run a user function future, converting any panic into an error.
     ///
-    /// This is necessary because `Error::Suspended` is a control-flow mechanism
-    /// (not a real error) and users may accidentally call `.unwrap()` on it,
-    /// causing a panic that would otherwise silently kill the spawned task and
-    /// leave it in a zombie state. The returned `Err` propagates up so the
+    /// A panicking user function would otherwise silently kill the spawned task
+    /// and leave it in a zombie state. The returned `Err` propagates up so the
     /// caller releases the task for retry.
     ///
     /// `AssertUnwindSafe` is sound here because on panic the caller skips all
@@ -330,15 +326,7 @@ impl Core {
                     .or_else(|| panic_payload.downcast_ref::<&str>().copied())
                     .unwrap_or("unknown panic");
 
-                if msg.contains("execution suspended") {
-                    tracing::error!(
-                        task_id = task_id,
-                        "user function panicked by unwrapping Error::Suspended — \
-                             use `?` to propagate suspension errors instead of `.unwrap()`"
-                    );
-                } else {
-                    tracing::error!(task_id = task_id, panic = msg, "user function panicked");
-                }
+                tracing::error!(task_id = task_id, panic = msg, "user function panicked");
 
                 Err(Error::Application {
                     message: format!("user function panicked: {}", msg),
@@ -1260,21 +1248,23 @@ mod tests {
 
     // ── Panic handling (catch_unwind) ─────────────────────────────
 
+    /// A user calling `.unwrap()` on a still-pending handle. The `.await` parks
+    /// before `.unwrap()` ever runs, so the task suspends cleanly instead of
+    /// panicking.
     #[resonate_sdk_macros::function]
-    async fn unwrap_suspend(ctx: &Context) -> Result<i32> {
-        // Simulates a user accidentally calling .unwrap() on a suspended rpc
+    async fn unwrap_on_pending_handle(ctx: &Context) -> Result<i32> {
         let handle = ctx.rpc::<i32>("dep", &()).spawn()?;
         let val: i32 = handle.await.unwrap();
         Ok(val)
     }
 
     #[tokio::test]
-    async fn panic_from_unwrap_suspend_is_caught_and_task_released() {
+    async fn unwrap_on_pending_handle_suspends_cleanly() {
         let harness = TestHarness::new();
-        let root = make_root_promise("p1", "unwrap_suspend", serde_json::json!(null));
+        let root = make_root_promise("p1", "unwrap_on_pending_handle", serde_json::json!(null));
 
         let mut registry = Registry::new();
-        registry.register(unwrap_suspend).unwrap();
+        registry.register(unwrap_on_pending_handle).unwrap();
 
         let core = test_core(
             harness.build_sender(),
@@ -1282,21 +1272,21 @@ mod tests {
             Arc::new(RwLock::new(registry)),
         );
         let decoded = noop_codec().decode_promise(root).unwrap();
-        let result = core
-            .execute_until_blocked("task-panic-suspend", 0, decoded, None)
-            .await;
+        let status = core
+            .execute_until_blocked("task-unwrap-suspend", 0, decoded, None)
+            .await
+            .expect("should suspend cleanly, not panic");
 
-        assert!(result.is_err(), "should return an error, not panic");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("panicked"),
-            "error should mention panic: {err_msg}"
-        );
+        assert_eq!(status, Status::Suspended);
 
         let requests = harness.sent_requests_json().await;
         assert!(
-            requests.iter().any(|r| r["kind"] == "task.release"),
-            "task should be released after panic"
+            requests.iter().any(|r| r["kind"] == "task.suspend"),
+            "task should suspend"
+        );
+        assert!(
+            !requests.iter().any(|r| r["kind"] == "task.release"),
+            "task should not be released"
         );
     }
 
@@ -1388,12 +1378,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panic_from_unwrap_suspend_stops_heartbeat() {
+    async fn suspend_from_unwrap_on_pending_handle_stops_heartbeat() {
         let harness = TestHarness::new();
-        let root = make_root_promise("p1", "unwrap_suspend", serde_json::json!(null));
+        let root = make_root_promise("p1", "unwrap_on_pending_handle", serde_json::json!(null));
 
         let mut registry = Registry::new();
-        registry.register(unwrap_suspend).unwrap();
+        registry.register(unwrap_on_pending_handle).unwrap();
 
         let hb = Arc::new(TrackingHeartbeat::new());
         let core = test_core_with_heartbeat(
@@ -1404,14 +1394,14 @@ mod tests {
         );
         let decoded = noop_codec().decode_promise(root).unwrap();
         let _ = core
-            .execute_until_blocked("task-panic-hb", 0, decoded, None)
+            .execute_until_blocked("task-suspend-hb", 0, decoded, None)
             .await;
 
         assert_eq!(hb.start_count(), 1, "heartbeat should be started once");
         assert_eq!(
             hb.stop_count(),
             1,
-            "heartbeat should be stopped even after panic"
+            "heartbeat should be stopped after suspend"
         );
     }
 

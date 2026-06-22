@@ -33,9 +33,6 @@ pub enum Error {
     #[error("io error: {0}")]
     IoError(#[from] std::io::Error),
 
-    #[error("execution suspended")]
-    Suspended,
-
     #[error("promise already settled")]
     AlreadySettled,
 
