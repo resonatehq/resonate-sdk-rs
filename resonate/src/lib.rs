@@ -16,6 +16,7 @@ pub mod registry;
 pub mod resonate;
 pub mod send;
 pub(crate) mod sequencing;
+pub mod sqlite;
 pub mod transport;
 pub mod types;
 
@@ -104,6 +105,7 @@ pub mod prelude {
     pub use crate::options::Options;
     pub use crate::promises::{Promises, Schedules};
     pub use crate::registry::Registry;
+    pub use crate::sqlite::SqliteNetwork;
     pub use crate::resonate::{
         ResRpcTask, ResRunTask, ResScheduleTask, Resonate, ResonateConfig, ResonateSchedule,
     };

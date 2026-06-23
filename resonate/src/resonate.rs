@@ -229,7 +229,11 @@ impl Resonate {
         let schedules = Schedules::new(sender.clone(), codec.clone());
 
         let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
-        let subscribe_every = Duration::from_secs(60);
+        // Refresh listeners every 10s. This re-registers listeners for still-pending
+        // promises and observes any settled state, recovering from an `unblock`
+        // push that was dropped because the worker's SSE/poll connection wasn't yet
+        // established when the promise settled (the server does not retry `unblock`).
+        let subscribe_every = Duration::from_secs(10);
 
         // Start periodic subscription refresh
         let refresh_handle = Self::spawn_subscription_refresh(

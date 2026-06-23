@@ -24,5 +24,14 @@ async-trait = "0.1"
 parking_lot = "0.12.5"
 seahash = "4"
 
-[dev-dependencies]
-test-with = "0.16"
+# SqliteNetwork — embedded SQLite-backed Resonate server (see src/sqlite).
+rusqlite = { version = "0.31", features = ["bundled"] }
+validator = { version = "0.18", features = ["derive"] }
+cron = "0.12"
+chrono = "0.4"
+url = "2"
+
+[features]
+# Vendored from the upstream Resonate server; gates extra yield points in the
+# SQLite storage layer for concurrency stress testing.
+concurrency-stress = []
