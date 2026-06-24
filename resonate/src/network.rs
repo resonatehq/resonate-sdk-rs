@@ -1480,7 +1480,7 @@ impl Network for LocalNetwork {
 // UTILITIES
 // =============================================================================
 
-fn uuid_no_dashes() -> String {
+pub(crate) fn uuid_no_dashes() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

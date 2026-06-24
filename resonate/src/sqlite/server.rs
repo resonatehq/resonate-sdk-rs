@@ -16,10 +16,11 @@ use validator::Validate;
 
 use super::address::is_valid_address;
 use super::persistence::{
-    PromiseCreateParams, PromiseSettleParams, ScheduleCreateParams, Storage, StorageError,
+    PromiseCreateParams, PromiseSettleParams, ScheduleCreateParams, StorageError,
     TaskAcquireParams, TaskCreateParams, TaskFenceCreateParams, TaskFenceSettleParams,
     TaskFulfillParams,
 };
+use super::persistence_sqlite::SqliteStorage;
 use super::processing;
 use super::types::{
     format_validation_errors, PromiseCreateData, PromiseGetData, PromiseRegisterCallbackData,
@@ -100,12 +101,12 @@ impl Default for Config {
 /// The running server — owns configuration and storage.
 pub struct Server {
     pub config: Config,
-    pub storage: Arc<Storage>,
+    pub storage: Arc<SqliteStorage>,
     pub debug_mode: AtomicBool,
 }
 
 impl Server {
-    pub fn new(config: Config, storage: Storage) -> Self {
+    pub fn new(config: Config, storage: SqliteStorage) -> Self {
         Self {
             config,
             storage: Arc::new(storage),
@@ -202,7 +203,7 @@ async fn op_promise_get(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: PromiseGetData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -222,8 +223,8 @@ async fn op_promise_get(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                     &format_validation_errors(&e),
                 ));
             }
-            db.try_timeout(&[&r.id], now)?;
-            match db.promise_get(&r.id)? {
+            db.try_timeout(&[&r.id], now).await?;
+            match db.promise_get(&r.id).await? {
                 Some(promise) => {
                     tracing::debug!(
                         promise_id = %r.id,
@@ -246,7 +247,7 @@ async fn op_promise_get(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                     ))
                 }
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -269,7 +270,7 @@ async fn op_promise_create(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: PromiseCreateData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -305,7 +306,7 @@ async fn op_promise_create(
                     ));
                 }
             }
-            db.try_timeout(&[&r.id], now)?;
+            db.try_timeout(&[&r.id], now).await?;
             let tags_json = serde_json::to_string(&r.tags).unwrap();
             let already_timedout = now >= r.timeout_at;
             let (state, created_at, settled_at) = if already_timedout {
@@ -336,7 +337,7 @@ async fn op_promise_create(
                 settled_at,
                 already_timedout,
                 address,
-            })?;
+            }).await?;
             if result.was_created {
                 tracing::info!(
                     promise_id = %result.promise.id,
@@ -358,7 +359,7 @@ async fn op_promise_create(
                 corr_id.clone(),
                 &PromiseResponseData { promise: result.promise },
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -387,7 +388,7 @@ async fn op_promise_settle(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: PromiseSettleData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -407,7 +408,7 @@ async fn op_promise_settle(
                     &format_validation_errors(&e),
                 ));
             }
-            db.try_timeout(&[&r.id], now)?;
+            db.try_timeout(&[&r.id], now).await?;
             let value_headers_json = r
                 .value
                 .headers
@@ -419,7 +420,7 @@ async fn op_promise_settle(
                 value_headers: value_headers_json.as_deref(),
                 value_data: r.value.data.as_deref(),
                 settled_at: now,
-            })?;
+            }).await?;
             match result.promise {
                 Some(promise) => {
                     assert_ne!(
@@ -457,7 +458,7 @@ async fn op_promise_settle(
                     ))
                 }
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -480,7 +481,7 @@ async fn op_promise_register_callback(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: PromiseRegisterCallbackData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -500,8 +501,8 @@ async fn op_promise_register_callback(
                     &format_validation_errors(&e),
                 ));
             }
-            db.try_timeout(&[&r.awaited, &r.awaiter], now)?;
-            let result = db.promise_register_callback(&r.awaited, &r.awaiter, now)?;
+            db.try_timeout(&[&r.awaited, &r.awaiter], now).await?;
+            let result = db.promise_register_callback(&r.awaited, &r.awaiter, now).await?;
             let p_awaited = match result.awaited {
                 Some(p) => p,
                 None => {
@@ -546,7 +547,7 @@ async fn op_promise_register_callback(
                 corr_id.clone(),
                 &PromiseResponseData { promise: p_awaited },
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -569,7 +570,7 @@ async fn op_promise_register_listener(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: PromiseRegisterListenerData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -602,8 +603,8 @@ async fn op_promise_register_listener(
                     "Invalid listener address",
                 ));
             }
-            db.try_timeout(&[&r.awaited], now)?;
-            match db.promise_register_listener(&r.awaited, &r.address)? {
+            db.try_timeout(&[&r.awaited], now).await?;
+            match db.promise_register_listener(&r.awaited, &r.address).await? {
                 Some(promise) => {
                     tracing::info!(
                         awaited = %r.awaited,
@@ -627,7 +628,7 @@ async fn op_promise_register_listener(
                     ))
                 }
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -650,7 +651,7 @@ async fn op_promise_search(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: PromiseSearchData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -689,7 +690,7 @@ async fn op_promise_search(
                 tags_json.as_deref(),
                 r.cursor.as_deref(),
                 limit + 1,
-            )?;
+            ).await?;
             let has_more = results.len() as i64 > limit;
             let promises: Vec<_> = results.into_iter().take(limit as usize).collect();
             let next_cursor = if has_more {
@@ -710,7 +711,7 @@ async fn op_promise_search(
                     cursor: next_cursor,
                 },
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -733,7 +734,7 @@ async fn op_task_get(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> Re
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskGetData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -753,8 +754,8 @@ async fn op_task_get(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> Re
                     &format_validation_errors(&e),
                 ));
             }
-            db.try_timeout(&[&r.id], now)?;
-            match db.task_get(&r.id)? {
+            db.try_timeout(&[&r.id], now).await?;
+            match db.task_get(&r.id).await? {
                 Some(task) => {
                     tracing::debug!(
                         task_id = %r.id,
@@ -778,7 +779,7 @@ async fn op_task_get(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> Re
                     ))
                 }
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -797,7 +798,7 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskCreateData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -834,10 +835,10 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                     ));
                 }
             }
-            db.try_timeout(&[action_id], now)?;
+            db.try_timeout(&[action_id], now).await?;
             // Lock preamble: ensures CTE and subsequent reads see
             // current state under READ COMMITTED.
-            let _ = db.lock_for_update(action_id)?;
+            let _ = db.lock_for_update(action_id).await?;
             let tags_json = serde_json::to_string(&action_data.tags).unwrap();
             let already_timedout = now >= action_data.timeout_at;
             let (p_state, created_at, settled_at) = if already_timedout {
@@ -874,14 +875,14 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                 already_timedout,
                 ttl: r.ttl,
                 pid: &r.pid,
-            })?;
+            }).await?;
 
             // If the promise is settled, process callbacks as a separate
             // statement. This fires any callbacks registered by concurrent
             // transactions (e.g. task.suspend) that committed after
             // try_timeout's snapshot but before now.
             if res.promise.state != PromiseState::Pending {
-                db.process_callbacks(action_id, now)?;
+                db.process_callbacks(action_id, now).await?;
             }
 
             // When the CTE created the task, use CTE result directly.
@@ -901,7 +902,7 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                     pid: if task_state == TaskState::Fulfilled { None } else { Some(r.pid.to_string()) },
                 };
                 let preload = if task_state == TaskState::Acquired {
-                    db.compute_preload(action_id)?
+                    db.compute_preload(action_id).await?
                 } else {
                     vec![]
                 };
@@ -945,7 +946,7 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                         time: now,
                         ttl: r.ttl,
                         pid: &r.pid,
-                    })?;
+                    }).await?;
                     if acquire_result.was_acquired {
                         let task = TaskRecord {
                             id: action_id.to_string(),
@@ -957,7 +958,7 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                         };
                         assert_eq!(res.promise.state, PromiseState::Pending, "invariant: settled promise with non-fulfilled task");
                         assert_eq!(acquire_result.task_version, Some(version + 1), "invariant: acquired task version must be version + 1");
-                        let preload = db.compute_preload(action_id)?;
+                        let preload = db.compute_preload(action_id).await?;
                         Ok(ResponseEnvelope::success(
                             kind_str.clone(),
                             corr_id.clone(),
@@ -1014,7 +1015,7 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                     "Already exists",
                 )),
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1039,7 +1040,7 @@ async fn op_task_acquire(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskAcquireData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1059,14 +1060,14 @@ async fn op_task_acquire(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                     &format_validation_errors(&e),
                 ));
             }
-            db.try_timeout(&[&r.id], now)?;
+            db.try_timeout(&[&r.id], now).await?;
             let result = db.task_acquire(&TaskAcquireParams {
                 task_id: &r.id,
                 version: r.version,
                 time: now,
                 ttl: r.ttl,
                 pid: &r.pid,
-            })?;
+            }).await?;
             match result.promise {
                 None => {
                     tracing::debug!(task_id = %r.id, "Task acquire: task not found");
@@ -1124,7 +1125,7 @@ async fn op_task_acquire(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                         ttl: Some(r.ttl),
                         pid: Some(r.pid.to_string()),
                     };
-                    let preload = db.compute_preload(&r.id)?;
+                    let preload = db.compute_preload(&r.id).await?;
                     Ok(ResponseEnvelope::success(
                         kind_str.clone(),
                         corr_id.clone(),
@@ -1136,7 +1137,7 @@ async fn op_task_acquire(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                     ))
                 }
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1155,7 +1156,7 @@ async fn op_task_release(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskReleaseData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1175,8 +1176,8 @@ async fn op_task_release(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                     &format_validation_errors(&e),
                 ));
             }
-            db.try_timeout(&[&r.id], now)?;
-            let (_, task_exists) = db.lock_for_update(&r.id)?;
+            db.try_timeout(&[&r.id], now).await?;
+            let (_, task_exists) = db.lock_for_update(&r.id).await?;
             if !task_exists {
                 tracing::debug!(task_id = %r.id, "Task release: task not found");
                 return Ok(ResponseEnvelope::error(
@@ -1186,7 +1187,7 @@ async fn op_task_release(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                     "Task not found",
                 ));
             }
-            let result = db.task_release(&r.id, r.version, now, db.task_retry_timeout())?;
+            let result = db.task_release(&r.id, r.version, now, db.task_retry_timeout()).await?;
             if result.task_released {
                 tracing::info!(task_id = %r.id, version = r.version, "Task released back to pending");
                 return Ok(ResponseEnvelope::new(
@@ -1212,7 +1213,7 @@ async fn op_task_release(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                 409,
                 "Task version mismatch or invalid state",
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1231,7 +1232,7 @@ async fn op_task_fulfill(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskFulfillData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1252,10 +1253,10 @@ async fn op_task_fulfill(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                 ));
             }
             let action_data = &r.action.data;
-            db.try_timeout(&[&action_data.id], now)?;
+            db.try_timeout(&[&action_data.id], now).await?;
             // Lock preamble: lock promise + task to prevent stale snapshot
             // in fulfillment CTE.
-            let (_, task_exists) = db.lock_for_update(&r.id)?;
+            let (_, task_exists) = db.lock_for_update(&r.id).await?;
             if !task_exists {
                 tracing::debug!(task_id = %r.id, "Task fulfill: task not found");
                 return Ok(ResponseEnvelope::error(
@@ -1278,7 +1279,7 @@ async fn op_task_fulfill(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                 value_headers: value_headers_json.as_deref(),
                 value_data: action_data.value.data.as_deref(),
                 settled_at: now,
-            })?;
+            }).await?;
             if !result.task_exists {
                 tracing::debug!(task_id = %r.id, "Task fulfill: task not found");
                 return Ok(ResponseEnvelope::error(
@@ -1311,7 +1312,7 @@ async fn op_task_fulfill(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                 corr_id.clone(),
                 &TaskFulfillResponseData { promise },
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1330,7 +1331,7 @@ async fn op_task_suspend(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskSuspendData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1358,15 +1359,15 @@ async fn op_task_suspend(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
             }
             // Lock the task row BEFORE try_timeout to prevent
             // try_timeout from fulfilling it via promise timeout.
-            let (_, task_exists) = db.lock_for_update(&r.id)?;
-            db.try_timeout(&timeout_ids, now)?;
+            let (_, task_exists) = db.lock_for_update(&r.id).await?;
+            db.try_timeout(&timeout_ids, now).await?;
             let mut seen = std::collections::HashSet::new();
             let unique_awaited: Vec<&str> = awaited_ids
                 .iter()
                 .filter(|id| seen.insert(id.as_str()))
                 .map(|s| s.as_str())
                 .collect();
-            let result = db.task_suspend(&r.id, r.version, &unique_awaited)?;
+            let result = db.task_suspend(&r.id, r.version, &unique_awaited).await?;
             if !result.task_matched {
                 // Use lock_for_update result — no separate task_get that
                 // could see a concurrent task creation.
@@ -1417,20 +1418,19 @@ async fn op_task_suspend(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                     serde_json::json!({}),
                 ));
             }
-            // Immediate resume (settled awaited promises)
             tracing::info!(
                 task_id = %r.id,
                 version = r.version,
                 "Task suspend: immediate resume, awaited promises already settled"
             );
-            let preload = db.compute_preload(&r.id)?;
+            let preload = db.compute_preload(&r.id).await?;
             Ok(ResponseEnvelope::new(
                 kind_str.clone(),
                 corr_id.clone(),
                 300,
                 serde_json::to_value(&TaskSuspendPreloadData { preload }).unwrap(),
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1449,7 +1449,7 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskFenceData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1472,9 +1472,9 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
             let action_kind = &r.action.kind;
             let action_data = &r.action.data;
             let action_id = action_data["id"].as_str().unwrap_or("");
-            db.try_timeout(&[&r.id, action_id], now)?;
+            db.try_timeout(&[&r.id, action_id], now).await?;
             // Lock preamble: ensures fence check sees current task state.
-            let _ = db.lock_for_update(&r.id)?;
+            let _ = db.lock_for_update(&r.id).await?;
 
             match action_kind.as_str() {
                 "promise.create" => {
@@ -1550,7 +1550,7 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                         settled_at,
                         already_timedout,
                         address,
-                    })?;
+                    }).await?;
                     if !result.task_exists {
                         tracing::debug!(task_id = %r.id, fenced_action = "promise.create", "Task fence rejected: task not found");
                         return Ok(ResponseEnvelope::error(
@@ -1583,7 +1583,7 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                         "head": { "corrId": corr_id, "status": 200, "version": "2026-04-01" },
                         "data": inner_data,
                     });
-                    let preload = db.compute_preload(&r.id)?;
+                    let preload = db.compute_preload(&r.id).await?;
                     Ok(ResponseEnvelope::success(
                         kind_str.clone(),
                         corr_id.clone(),
@@ -1627,7 +1627,7 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                         value_headers: value_headers_json.as_deref(),
                         value_data: settle_data.value.data.as_deref(),
                         settled_at: now,
-                    })?;
+                    }).await?;
                     if !result.task_exists {
                         tracing::debug!(task_id = %r.id, fenced_action = "promise.settle", "Task fence rejected: task not found");
                         return Ok(ResponseEnvelope::error(
@@ -1667,7 +1667,7 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                         "head": { "corrId": corr_id, "status": inner_status, "version": "2026-04-01" },
                         "data": inner_data,
                     });
-                    let preload = db.compute_preload(&r.id)?;
+                    let preload = db.compute_preload(&r.id).await?;
                     Ok(ResponseEnvelope::success(
                         kind_str.clone(),
                         corr_id.clone(),
@@ -1691,7 +1691,7 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                     ))
                 }
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1714,7 +1714,7 @@ async fn op_task_heartbeat(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskHeartbeatData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1736,7 +1736,7 @@ async fn op_task_heartbeat(
             }
             let task_pairs: Vec<(&str, i64)> =
                 r.tasks.iter().map(|t| (t.id.as_str(), t.version)).collect();
-            db.task_heartbeat(&r.pid, &task_pairs, now)?;
+            db.task_heartbeat(&r.pid, &task_pairs, now).await?;
             tracing::debug!(
                 pid = %r.pid,
                 task_count = task_pairs.len(),
@@ -1748,7 +1748,7 @@ async fn op_task_heartbeat(
                 200,
                 serde_json::json!({}),
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1767,7 +1767,7 @@ async fn op_task_halt(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> R
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskHaltData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1787,8 +1787,8 @@ async fn op_task_halt(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> R
                     &format_validation_errors(&e),
                 ));
             }
-            db.try_timeout(&[&r.id], now)?;
-            let result = db.task_halt(&r.id)?;
+            db.try_timeout(&[&r.id], now).await?;
+            let result = db.task_halt(&r.id).await?;
             if !result.task_exists {
                 tracing::debug!(task_id = %r.id, "Task halt: not found");
                 Ok(ResponseEnvelope::error(
@@ -1814,7 +1814,7 @@ async fn op_task_halt(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> R
                     serde_json::json!({}),
                 ))
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1837,7 +1837,7 @@ async fn op_task_continue(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskContinueData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1857,8 +1857,8 @@ async fn op_task_continue(
                     &format_validation_errors(&e),
                 ));
             }
-            db.try_timeout(&[&r.id], now)?;
-            let result = db.task_continue(&r.id, now)?;
+            db.try_timeout(&[&r.id], now).await?;
+            let result = db.task_continue(&r.id, now).await?;
             if !result.task_exists {
                 tracing::debug!(task_id = %r.id, "Task continue: not found");
                 Ok(ResponseEnvelope::error(
@@ -1884,7 +1884,7 @@ async fn op_task_continue(
                     "Task is not halted",
                 ))
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1903,7 +1903,7 @@ async fn op_task_search(state: &Arc<Server>, req: &RequestEnvelope, _now: i64) -
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: TaskSearchData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1936,7 +1936,7 @@ async fn op_task_search(state: &Arc<Server>, req: &RequestEnvelope, _now: i64) -
                 None => 100,
             };
             let state_str = r.state.map(|s| s.as_str());
-            let results = db.task_search(state_str, r.cursor.as_deref(), limit + 1)?;
+            let results = db.task_search(state_str, r.cursor.as_deref(), limit + 1).await?;
             let has_more = results.len() as i64 > limit;
             let tasks: Vec<_> = results.into_iter().take(limit as usize).collect();
             let next_cursor = if has_more {
@@ -1957,7 +1957,7 @@ async fn op_task_search(state: &Arc<Server>, req: &RequestEnvelope, _now: i64) -
                     cursor: next_cursor,
                 },
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -1984,7 +1984,7 @@ async fn op_schedule_get(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: ScheduleGetData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -2004,7 +2004,7 @@ async fn op_schedule_get(
                     &format_validation_errors(&e),
                 ));
             }
-            match db.schedule_get(&r.id)? {
+            match db.schedule_get(&r.id).await? {
                 Some(schedule) => {
                     tracing::debug!(
                         schedule_id = %r.id,
@@ -2028,7 +2028,7 @@ async fn op_schedule_get(
                     ))
                 }
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -2051,7 +2051,7 @@ async fn op_schedule_create(
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: ScheduleCreateData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -2101,7 +2101,7 @@ async fn op_schedule_create(
                 promise_tags: &promise_tags_json,
                 created_at: now,
                 next_run_at,
-            })?;
+            }).await?;
             tracing::info!(
                 schedule_id = %schedule.id,
                 cron = %schedule.cron,
@@ -2113,7 +2113,7 @@ async fn op_schedule_create(
                 corr_id.clone(),
                 &ScheduleResponseData { schedule },
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -2132,7 +2132,7 @@ async fn op_schedule_delete(state: &Arc<Server>, req: &RequestEnvelope) -> Respo
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: ScheduleDeleteData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -2152,7 +2152,7 @@ async fn op_schedule_delete(state: &Arc<Server>, req: &RequestEnvelope) -> Respo
                     &format_validation_errors(&e),
                 ));
             }
-            if db.schedule_delete(&r.id)? {
+            if db.schedule_delete(&r.id).await? {
                 tracing::info!(schedule_id = %r.id, "Schedule deleted");
                 Ok(ResponseEnvelope::new(
                     kind_str.clone(),
@@ -2169,7 +2169,7 @@ async fn op_schedule_delete(state: &Arc<Server>, req: &RequestEnvelope) -> Respo
                     "Schedule not found",
                 ))
             }
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -2188,7 +2188,7 @@ async fn op_schedule_search(state: &Arc<Server>, req: &RequestEnvelope) -> Respo
     let corr_id = req.head.corr_id.clone();
     match state
         .storage
-        .transact(move |db| {
+        .transact(move |db| Box::pin(async move {
             let r: ScheduleSearchData = match serde_json::from_value(data.clone()) {
                 Ok(d) => d,
                 Err(e) => {
@@ -2222,7 +2222,7 @@ async fn op_schedule_search(state: &Arc<Server>, req: &RequestEnvelope) -> Respo
                 None => 10,
             };
             let schedules =
-                db.schedule_search(tags_json.as_deref(), r.cursor.as_deref(), limit + 1)?;
+                db.schedule_search(tags_json.as_deref(), r.cursor.as_deref(), limit + 1).await?;
             let limit_usize = limit as usize;
             let has_more = schedules.len() > limit_usize;
             let result_schedules: Vec<_> = schedules.into_iter().take(limit_usize).collect();
@@ -2244,7 +2244,7 @@ async fn op_schedule_search(state: &Arc<Server>, req: &RequestEnvelope) -> Respo
                     cursor: next_cursor,
                 },
             ))
-        })
+        }))
         .await
     {
         Ok(resp) => resp,
@@ -2262,7 +2262,7 @@ async fn op_schedule_search(state: &Arc<Server>, req: &RequestEnvelope) -> Respo
 // ============================================================================
 
 async fn op_debug_reset(state: &Arc<Server>, req: &RequestEnvelope) -> ResponseEnvelope {
-    match state.storage.transact(move |db| db.debug_reset()).await {
+    match state.storage.transact(move |db| Box::pin(async move { db.debug_reset().await })).await {
         Ok(()) => {
             tracing::warn!("Debug reset: all data cleared");
             ResponseEnvelope::new(
@@ -2285,7 +2285,7 @@ async fn op_debug_reset(state: &Arc<Server>, req: &RequestEnvelope) -> ResponseE
 }
 
 async fn op_debug_snap(state: &Arc<Server>, req: &RequestEnvelope) -> ResponseEnvelope {
-    match state.storage.query(move |db| db.snap()).await {
+    match state.storage.query(move |db| Box::pin(async move { db.snap().await })).await {
         Ok(snapshot) => {
             let data = serde_json::to_value(snapshot).unwrap_or(Value::Null);
             ResponseEnvelope::new(req.kind.clone(), req.head.corr_id.clone(), 200, data)
@@ -2314,7 +2314,7 @@ async fn op_debug_tick(state: &Arc<Server>, req: &RequestEnvelope) -> ResponseEn
 
     match state
         .storage
-        .transact(move |db| processing::process_all_timeouts(db, time))
+        .transact(move |db| Box::pin(async move { processing::process_all_timeouts(db, time).await }))
         .await
     {
         Ok(_) => ResponseEnvelope::new(

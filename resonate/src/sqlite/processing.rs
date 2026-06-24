@@ -5,27 +5,28 @@
 //! helper) is kept. The background loop that drives it lives in
 //! [`super::SqliteNetwork::start`]; the `metrics` counter increment is dropped.
 
-use super::persistence::{Db, StorageResult};
+use super::persistence::StorageResult;
+use super::persistence_sqlite::SqliteDb;
 use super::util;
 
 /// Process all expired timeouts at the given time.
-pub fn process_all_timeouts(db: &dyn Db, time: i64) -> StorageResult<()> {
+pub async fn process_all_timeouts(db: &SqliteDb<'_>, time: i64) -> StorageResult<()> {
     // Run the three tick CTE statements (promise timeouts, task retry, task lease)
     tracing::debug!(time = time, "Processing expired timeouts");
-    db.process_timeouts(time)?;
+    db.process_timeouts(time).await?;
 
     // Process expired schedules (application-level cron computation)
-    process_schedule_timeouts(db, time)?;
+    process_schedule_timeouts(db, time).await?;
 
     Ok(())
 }
 
 /// Process expired schedule timeouts.
-fn process_schedule_timeouts(db: &dyn Db, time: i64) -> StorageResult<()> {
-    let expired = db.get_expired_schedule_timeouts(time)?;
+async fn process_schedule_timeouts(db: &SqliteDb<'_>, time: i64) -> StorageResult<()> {
+    let expired = db.get_expired_schedule_timeouts(time).await?;
 
     for (schedule_id, fired_at) in &expired {
-        let schedule = match db.schedule_get(schedule_id)? {
+        let schedule = match db.schedule_get(schedule_id).await? {
             Some(s) => s,
             None => continue,
         };
@@ -44,13 +45,10 @@ fn process_schedule_timeouts(db: &dyn Db, time: i64) -> StorageResult<()> {
         promise_tags.insert("resonate:parent".to_string(), promise_id.clone());
         promise_tags.insert("resonate:prefix".to_string(), promise_id.clone());
 
-        match db.process_schedule_timeout(
-            schedule_id,
-            *fired_at,
-            next_run_at,
-            time,
-            &promise_tags,
-        )? {
+        match db
+            .process_schedule_timeout(schedule_id, *fired_at, next_run_at, time, &promise_tags)
+            .await?
+        {
             Some(_) => {
                 tracing::info!(
                     schedule_id = %schedule_id,

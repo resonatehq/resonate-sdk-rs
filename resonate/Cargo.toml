@@ -24,8 +24,10 @@ async-trait = "0.1"
 parking_lot = "0.12.5"
 seahash = "4"
 
-# SqliteNetwork — embedded SQLite-backed Resonate server (see src/sqlite).
-rusqlite = { version = "0.31", features = ["bundled"] }
+# SqliteNetwork — embedded libsql (Turso)-backed Resonate server (see src/sqlite).
+# Default features (core + replication + remote) cover local files, embedded
+# replicas, and remote Turso/sqld databases.
+libsql = "0.9"
 validator = { version = "0.18", features = ["derive"] }
 cron = "0.12"
 chrono = "0.4"

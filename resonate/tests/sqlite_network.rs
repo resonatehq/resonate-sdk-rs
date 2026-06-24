@@ -3,8 +3,7 @@
 //! Unlike `e2e.rs` (which requires a running `resonate` server via
 //! `RESONATE_URL`), these run entirely in-process against a SQLite database,
 //! exercising the full execute / suspend / resume cycle through the vendored
-//! server engine. They require a multi-threaded runtime because the SQLite
-//! storage layer uses `tokio::task::block_in_place`.
+//! server engine. They run on a multi-threaded Tokio runtime.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,9 +29,10 @@ async fn with_timeout<F: std::future::IntoFuture>(f: F) -> F::Output {
 }
 
 /// Build a `Resonate` backed by an in-memory `SqliteNetwork`.
-fn make_resonate() -> Resonate {
+async fn make_resonate() -> Resonate {
     let net = Arc::new(
         SqliteNetwork::new(":memory:", Some(unique_id("worker")), Some(unique_id("group")))
+            .await
             .expect("open sqlite network"),
     );
     Resonate::new(ResonateConfig {
@@ -71,7 +71,7 @@ async fn run_sub_workflow(ctx: &Context) -> Result<i64> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn connectivity() {
-    let r = make_resonate();
+    let r = make_resonate().await;
     let id = unique_id("connectivity");
 
     let created = with_timeout(
@@ -90,7 +90,7 @@ async fn connectivity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn simple_add() {
-    let r = make_resonate();
+    let r = make_resonate().await;
     r.register(add).unwrap();
 
     let id = unique_id("simple-add");
@@ -102,7 +102,7 @@ async fn simple_add() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn simple_greet() {
-    let r = make_resonate();
+    let r = make_resonate().await;
     r.register(greet).unwrap();
 
     let id = unique_id("simple-greet");
@@ -116,7 +116,7 @@ async fn simple_greet() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workflow_with_ctx_run() {
-    let r = make_resonate();
+    let r = make_resonate().await;
     r.register(add).unwrap();
     r.register(run_sub_workflow).unwrap();
 
@@ -131,7 +131,7 @@ async fn workflow_with_ctx_run() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workflow_sequential_rpcs() {
-    let r = make_resonate();
+    let r = make_resonate().await;
     r.register(add).unwrap();
     r.register(sequential_workflow).unwrap();
 
@@ -146,7 +146,7 @@ async fn workflow_sequential_rpcs() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn run_is_idempotent() {
-    let r = make_resonate();
+    let r = make_resonate().await;
     r.register(add).unwrap();
 
     let id = unique_id("idempotent");

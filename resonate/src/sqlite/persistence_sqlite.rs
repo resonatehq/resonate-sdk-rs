@@ -1,25 +1,31 @@
-//! SQLite storage backend — vendored verbatim from
-//! `resonate/src/persistence/persistence_sqlite.rs` (the Resonate server).
+//! libsql (Turso) storage backend — ported from the rusqlite version vendored
+//! from `resonate/src/persistence/persistence_sqlite.rs` (the Resonate server).
 //!
-//! The only changes are the two `use` blocks, repointed from `super::{...}` /
-//! `crate::types::{...}` to the vendored `super::persistence` / `super::types`
-//! modules. The schema, SQL, and transaction logic are unchanged.
+//! The schema and SQL are unchanged. The rusqlite (synchronous) API has been
+//! replaced with the libsql (async) API: storage methods are inherent `async fn`s
+//! on the concrete [`SqliteDb`], driven through [`SqliteStorage::transact`] /
+//! [`SqliteStorage::query`]. A single connection is serialized behind a
+//! [`tokio::sync::Mutex`], mirroring the original `Arc<Mutex<Connection>>`.
 
-use rusqlite::{params, Connection};
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::pin::Pin;
+
+use libsql::params::IntoParams;
+use libsql::{params, Builder, Connection, Database};
 
 use super::persistence::{
-    Db, OutgoingExecute, OutgoingUnblock, PromiseCreateParams, PromiseCreateResult,
-    PromiseSettleParams, PromiseSettleResult, RegisterCallbackResult, ScheduleCreateParams,
-    StorageResult, TaskAcquireParams, TaskAcquireResult, TaskContinueResult, TaskCreateParams,
-    TaskCreateResult, TaskFenceCreateParams, TaskFenceResult, TaskFenceSettleParams,
-    TaskFulfillParams, TaskFulfillResult, TaskHaltResult, TaskReleaseResult, TaskSuspendResult,
+    OutgoingExecute, OutgoingUnblock, PromiseCreateParams, PromiseCreateResult, PromiseSettleParams,
+    PromiseSettleResult, RegisterCallbackResult, ScheduleCreateParams, StorageResult,
+    TaskAcquireParams, TaskAcquireResult, TaskContinueResult, TaskCreateParams, TaskCreateResult,
+    TaskFenceCreateParams, TaskFenceResult, TaskFenceSettleParams, TaskFulfillParams,
+    TaskFulfillResult, TaskHaltResult, TaskReleaseResult, TaskSuspendResult,
 };
 use super::types::{
     PromiseRecord, PromiseState, PromiseValue, ScheduleRecord, Snapshot, SnapshotCallback,
     SnapshotListener, SnapshotMessage, SnapshotPromiseTimeout, SnapshotTaskTimeout, TaskRecord,
     TaskState,
 };
+use super::SqliteBackend;
 
 fn parse_promise_state(s: &str) -> PromiseState {
     s.parse()
@@ -31,8 +37,35 @@ fn parse_task_state(s: &str) -> TaskState {
         .unwrap_or_else(|e| panic!("corrupt task state in DB: {}", e))
 }
 
+// === Single-scalar query helpers (replace rusqlite's `query_row`) ===
+
+/// Fetch a single `i64` from column 0 of the first row. Errors if no row.
+async fn scalar_i64(conn: &Connection, sql: &str, params: impl IntoParams) -> libsql::Result<i64> {
+    let mut stmt = conn.prepare(sql).await?;
+    stmt.query_row(params).await?.get::<i64>(0)
+}
+
+/// Fetch a single `bool` from column 0 of the first row. Errors if no row.
+async fn scalar_bool(conn: &Connection, sql: &str, params: impl IntoParams) -> libsql::Result<bool> {
+    let mut stmt = conn.prepare(sql).await?;
+    stmt.query_row(params).await?.get::<bool>(0)
+}
+
+/// Fetch an optional `String` from column 0, swallowing any error / missing row
+/// (mirrors the original `query_row(..).ok().flatten()` pattern).
+async fn opt_string_col0(conn: &Connection, sql: &str, params: impl IntoParams) -> Option<String> {
+    let mut stmt = match conn.prepare(sql).await {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    match stmt.query_row(params).await {
+        Ok(row) => row.get::<Option<String>>(0).ok().flatten(),
+        Err(_) => None,
+    }
+}
+
 /// Initialize database: set pragmas and create schema
-pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) async fn init_db(conn: &Connection) -> libsql::Result<()> {
     conn.execute_batch(
         "
         PRAGMA journal_mode = WAL;
@@ -40,12 +73,13 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         PRAGMA foreign_keys = ON;
         PRAGMA synchronous = NORMAL;
         ",
-    )?;
-    create_schema(conn)?;
+    )
+    .await?;
+    create_schema(conn).await?;
     Ok(())
 }
 
-fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
+async fn create_schema(conn: &Connection) -> libsql::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS promises (
@@ -139,123 +173,159 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_schedule_timeouts_timeout_at_id ON schedule_timeouts (timeout_at ASC, id ASC);
         ",
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 pub struct SqliteStorage {
-    conn: Arc<Mutex<Connection>>,
+    /// Kept alive for the lifetime of the storage so that an embedded-replica's
+    /// background sync keeps running.
+    _db: Database,
+    conn: tokio::sync::Mutex<Connection>,
     task_retry_timeout: i64,
 }
 
 impl SqliteStorage {
-    pub fn open(path: &str, task_retry_timeout: i64) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
-        init_db(&conn)?;
+    pub async fn open(backend: &SqliteBackend, task_retry_timeout: i64) -> libsql::Result<Self> {
+        let db = match backend {
+            SqliteBackend::Local(path) => Builder::new_local(path).build().await?,
+            SqliteBackend::Remote { url, auth_token } => {
+                Builder::new_remote(url.clone(), auth_token.clone())
+                    .build()
+                    .await?
+            }
+            SqliteBackend::RemoteReplica {
+                path,
+                url,
+                auth_token,
+                sync_interval,
+            } => {
+                let mut builder =
+                    Builder::new_remote_replica(path, url.clone(), auth_token.clone());
+                if let Some(interval) = sync_interval {
+                    builder = builder.sync_interval(*interval);
+                }
+                builder.build().await?
+            }
+        };
+        let conn = db.connect()?;
+        init_db(&conn).await?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            _db: db,
+            conn: tokio::sync::Mutex::new(conn),
             task_retry_timeout,
         })
     }
 
     pub async fn transact<F, T>(&self, f: F) -> StorageResult<T>
     where
-        F: FnMut(&dyn Db) -> StorageResult<T> + Send + 'static,
-        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a SqliteDb<'a>,
+            ) -> Pin<Box<dyn Future<Output = StorageResult<T>> + Send + 'a>>
+            + Send,
+        T: Send,
     {
         #[cfg(feature = "concurrency-stress")]
         tokio::task::yield_now().await;
 
-        let mut f = f;
-        let conn = Arc::clone(&self.conn);
-        let task_retry_timeout = self.task_retry_timeout;
-        tokio::task::block_in_place(|| {
-            // Use unwrap_or_else to recover from poisoned mutex (a prior panic
-            // while holding the lock). The connection itself is still valid.
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let tx = conn.unchecked_transaction()?;
-            let db = SqliteDb {
-                conn: &tx,
-                task_retry_timeout,
-            };
-            let result = f(&db)?;
-            tx.commit()?;
-            Ok(result)
-        })
+        let guard = self.conn.lock().await;
+        let tx = guard.transaction().await?;
+        let db = SqliteDb {
+            conn: &tx,
+            task_retry_timeout: self.task_retry_timeout,
+        };
+        let result = f(&db).await;
+        drop(db);
+        match result {
+            Ok(value) => {
+                tx.commit().await?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn query<F, T>(&self, f: F) -> StorageResult<T>
     where
-        F: FnMut(&dyn Db) -> StorageResult<T> + Send + 'static,
-        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a SqliteDb<'a>,
+            ) -> Pin<Box<dyn Future<Output = StorageResult<T>> + Send + 'a>>
+            + Send,
+        T: Send,
     {
         #[cfg(feature = "concurrency-stress")]
         tokio::task::yield_now().await;
 
-        let mut f = f;
-        let conn = Arc::clone(&self.conn);
-        let task_retry_timeout = self.task_retry_timeout;
-        tokio::task::block_in_place(|| {
-            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let db = SqliteDb {
-                conn: &conn,
-                task_retry_timeout,
-            };
-            f(&db)
-        })
+        let guard = self.conn.lock().await;
+        let db = SqliteDb {
+            conn: &guard,
+            task_retry_timeout: self.task_retry_timeout,
+        };
+        f(&db).await
     }
 }
 
-struct SqliteDb<'a> {
-    conn: &'a rusqlite::Connection,
+pub(crate) struct SqliteDb<'a> {
+    conn: &'a Connection,
     task_retry_timeout: i64,
 }
 
 // === Settlement chain helpers (multi-statement within the transaction) ===
 
 /// SettlementEnqueued: fulfill task, delete task timeout, delete callbacks by awaiter
-fn settlement_enqueued(tx: &rusqlite::Connection, promise_id: &str) -> rusqlite::Result<bool> {
-    let fulfilled = tx.execute(
-        "UPDATE tasks SET state = 'fulfilled' WHERE id = ?1 AND state != 'fulfilled'",
-        params![promise_id],
-    )? > 0;
+async fn settlement_enqueued(tx: &Connection, promise_id: &str) -> libsql::Result<bool> {
+    let fulfilled = tx
+        .execute(
+            "UPDATE tasks SET state = 'fulfilled' WHERE id = ?1 AND state != 'fulfilled'",
+            params![promise_id],
+        )
+        .await?
+        > 0;
     if fulfilled {
         tx.execute(
             "DELETE FROM task_timeouts WHERE id = ?1",
             params![promise_id],
-        )?;
+        )
+        .await?;
         tx.execute(
             "DELETE FROM callbacks WHERE awaiter_id = ?1",
             params![promise_id],
-        )?;
+        )
+        .await?;
     }
     Ok(fulfilled)
 }
 
 /// ResumptionEnqueued: mark callbacks ready, resume suspended tasks, insert outgoing
-fn resumption_enqueued(
-    tx: &rusqlite::Connection,
+async fn resumption_enqueued(
+    tx: &Connection,
     awaited_id: &str,
     time: i64,
     task_retry_timeout: i64,
     exclude_fulfilled: Option<&[String]>,
-) -> rusqlite::Result<()> {
-    // Mark callbacks ready
+) -> libsql::Result<()> {
     tx.execute(
         "UPDATE callbacks SET ready = true WHERE awaited_id = ?1",
         params![awaited_id],
-    )?;
+    )
+    .await?;
 
     // Find awaiter IDs that need resuming (suspended tasks whose callbacks just became ready)
-    let mut stmt = tx.prepare(
-        "SELECT DISTINCT c.awaiter_id FROM callbacks c
+    let stmt = tx
+        .prepare(
+            "SELECT DISTINCT c.awaiter_id FROM callbacks c
          JOIN tasks t ON t.id = c.awaiter_id
          WHERE c.awaited_id = ?1 AND c.ready = true AND t.state = 'suspended'",
-    )?;
+        )
+        .await?;
     let awaiter_ids: Vec<String> = {
-        let mut rows = stmt.query(params![awaited_id])?;
+        let mut rows = stmt.query(params![awaited_id]).await?;
         let mut ids = Vec::new();
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().await? {
             let id: String = row.get(0)?;
             if let Some(excluded) = exclude_fulfilled {
                 if excluded.contains(&id) {
@@ -268,39 +338,39 @@ fn resumption_enqueued(
     };
 
     for awaiter_id in &awaiter_ids {
+        let awaiter_id = awaiter_id.as_str();
         // Resume: set to pending (version unchanged — only claim bumps version)
-        let updated = tx.execute(
-            "UPDATE tasks SET state = 'pending' WHERE id = ?1 AND state = 'suspended'",
-            params![awaiter_id],
-        )?;
+        let updated = tx
+            .execute(
+                "UPDATE tasks SET state = 'pending' WHERE id = ?1 AND state = 'suspended'",
+                params![awaiter_id],
+            )
+            .await?;
         if updated > 0 {
-            // Get current version
-            let version: i64 = tx.query_row(
+            let version: i64 = scalar_i64(
+                tx,
                 "SELECT version FROM tasks WHERE id = ?1",
                 params![awaiter_id],
-                |r| r.get(0),
-            )?;
-            // Insert/update task timeout (retry type 0)
+            )
+            .await?;
+            // Retry timeout (type 0)
             tx.execute(
                 "INSERT INTO task_timeouts (timeout_at, id, timeout_type, ttl) VALUES (?1, ?2, 0, ?3)
                  ON CONFLICT (id) DO UPDATE SET timeout_at = ?1, timeout_type = 0, process_id = NULL, ttl = ?3",
                 params![time + task_retry_timeout, awaiter_id, task_retry_timeout],
-            )?;
-            // Insert/update outgoing execute
-            let target: Option<String> = tx
-                .query_row(
-                    "SELECT target FROM promises WHERE id = ?1",
-                    params![awaiter_id],
-                    |r| r.get(0),
-                )
-                .ok()
-                .flatten();
+            ).await?;
+            let target: Option<String> = opt_string_col0(
+                tx,
+                "SELECT target FROM promises WHERE id = ?1",
+                params![awaiter_id],
+            )
+            .await;
             if let Some(target) = target {
                 tx.execute(
                     "INSERT INTO outgoing_execute (id, version, address) VALUES (?1, ?2, ?3)
                      ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address",
                     params![awaiter_id, version, target],
-                )?;
+                ).await?;
             }
         }
     }
@@ -308,24 +378,26 @@ fn resumption_enqueued(
 }
 
 /// ListenerUnblocked: insert outgoing unblock messages, delete listeners
-fn listener_unblocked(tx: &rusqlite::Connection, promise_id: &str) -> rusqlite::Result<()> {
+async fn listener_unblocked(tx: &Connection, promise_id: &str) -> libsql::Result<()> {
     tx.execute(
         "INSERT INTO outgoing_unblock (promise_id, address)
          SELECT l.promise_id, l.address FROM listeners l WHERE l.promise_id = ?1
          ON CONFLICT DO NOTHING",
         params![promise_id],
-    )?;
+    )
+    .await?;
     tx.execute(
         "DELETE FROM listeners WHERE promise_id = ?1",
         params![promise_id],
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Full settlement chain: settle promise + SettlementEnqueued + ResumptionEnqueued + ListenerUnblocked
 #[allow(clippy::too_many_arguments)]
-fn settle_promise(
-    tx: &rusqlite::Connection,
+async fn settle_promise(
+    tx: &Connection,
     id: &str,
     state: &str,
     value_headers: Option<&str>,
@@ -333,60 +405,68 @@ fn settle_promise(
     settled_at: i64,
     time: i64,
     task_retry_timeout: i64,
-) -> rusqlite::Result<bool> {
+) -> libsql::Result<bool> {
     let updated = tx.execute(
         "UPDATE promises SET state = ?2, value_headers = ?3, value_data = ?4, settled_at = ?5 WHERE id = ?1 AND state = 'pending'",
         params![id, state, value_headers, value_data, settled_at],
-    )?;
+    ).await?;
     if updated == 0 {
         return Ok(false);
     }
 
-    tx.execute("DELETE FROM promise_timeouts WHERE id = ?1", params![id])?;
-    settlement_enqueued(tx, id)?;
-    resumption_enqueued(tx, id, time, task_retry_timeout, None)?;
-    listener_unblocked(tx, id)?;
+    tx.execute("DELETE FROM promise_timeouts WHERE id = ?1", params![id])
+        .await?;
+    settlement_enqueued(tx, id).await?;
+    resumption_enqueued(tx, id, time, task_retry_timeout, None).await?;
+    listener_unblocked(tx, id).await?;
     Ok(true)
 }
 
-impl<'a> Db for SqliteDb<'a> {
-    fn task_retry_timeout(&self) -> i64 {
+impl<'a> SqliteDb<'a> {
+    pub(crate) fn task_retry_timeout(&self) -> i64 {
         self.task_retry_timeout
     }
 
-    fn lock_for_update(&self, id: &str) -> StorageResult<(bool, bool)> {
-        let promise_exists = self.conn.query_row(
+    pub(crate) async fn lock_for_update(&self, id: &str) -> StorageResult<(bool, bool)> {
+        let promise_exists = scalar_i64(
+            self.conn,
             "SELECT COUNT(*) FROM promises WHERE id = ?1",
             params![id],
-            |r| r.get::<_, i64>(0),
-        )? > 0;
-        let task_exists = self.conn.query_row(
+        )
+        .await?
+            > 0;
+        let task_exists = scalar_i64(
+            self.conn,
             "SELECT COUNT(*) FROM tasks WHERE id = ?1",
             params![id],
-            |r| r.get::<_, i64>(0),
-        )? > 0;
+        )
+        .await?
+            > 0;
         Ok((promise_exists, task_exists))
     }
 
-    fn process_callbacks(&self, _promise_id: &str, _time: i64) -> StorageResult<()> {
+    pub(crate) async fn process_callbacks(&self, _promise_id: &str, _time: i64) -> StorageResult<()> {
         Ok(())
     }
 
-    fn try_timeout(&self, ids: &[&str], time: i64) -> StorageResult<()> {
+    pub(crate) async fn try_timeout(&self, ids: &[&str], time: i64) -> StorageResult<()> {
         if ids.is_empty() {
             return Ok(());
         }
         let ids_json = serde_json::to_string(ids).unwrap();
         // Find expired promises from the ID set
-        let mut stmt = self.conn.prepare(
-            "SELECT id, timer, timeout_at FROM promises
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT id, timer, timeout_at FROM promises
              WHERE id IN (SELECT value FROM json_each(?1))
                AND state = 'pending' AND timeout_at <= ?2",
-        )?;
+            )
+            .await?;
         let expired: Vec<(String, bool, i64)> = {
-            let mut rows = stmt.query(params![ids_json, time])?;
+            let mut rows = stmt.query(params![ids_json, time]).await?;
             let mut results = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 results.push((row.get(0)?, row.get(1)?, row.get(2)?));
             }
             results
@@ -399,6 +479,7 @@ impl<'a> Db for SqliteDb<'a> {
         // Settle each expired promise
         let mut fulfilled_ids = Vec::new();
         for (id, timer, timeout_at) in &expired {
+            let id = id.as_str();
             let new_state = if *timer {
                 "resolved"
             } else {
@@ -407,17 +488,16 @@ impl<'a> Db for SqliteDb<'a> {
             self.conn.execute(
                 "UPDATE promises SET state = ?2, settled_at = ?3 WHERE id = ?1 AND state = 'pending'",
                 params![id, new_state, timeout_at],
-            )?;
+            ).await?;
             self.conn
-                .execute("DELETE FROM promise_timeouts WHERE id = ?1", params![id])?;
+                .execute("DELETE FROM promise_timeouts WHERE id = ?1", params![id])
+                .await?;
 
-            // SettlementEnqueued
-            if settlement_enqueued(self.conn, id)? {
-                fulfilled_ids.push(id.clone());
+            if settlement_enqueued(self.conn, id).await? {
+                fulfilled_ids.push(id.to_string());
             }
         }
 
-        // ResumptionEnqueued for each expired
         for (id, _, _) in &expired {
             resumption_enqueued(
                 self.conn,
@@ -425,29 +505,32 @@ impl<'a> Db for SqliteDb<'a> {
                 time,
                 self.task_retry_timeout,
                 Some(&fulfilled_ids),
-            )?;
+            )
+            .await?;
         }
 
-        // ListenerUnblocked for each expired
         for (id, _, _) in &expired {
-            listener_unblocked(self.conn, id)?;
+            listener_unblocked(self.conn, id).await?;
         }
 
         Ok(())
     }
 
-    fn promise_get(&self, id: &str) -> StorageResult<Option<PromiseRecord>> {
-        let mut stmt = self.conn.prepare(
+    pub(crate) async fn promise_get(&self, id: &str) -> StorageResult<Option<PromiseRecord>> {
+        let stmt = self.conn.prepare(
             "SELECT id, state, param_headers, param_data, value_headers, value_data, tags, timeout_at, created_at, settled_at FROM promises WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query(params![id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row_to_promise(row)?)),
+        ).await?;
+        let mut rows = stmt.query(params![id]).await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row_to_promise(&row)?)),
             None => Ok(None),
         }
     }
 
-    fn promise_create(&self, params: &PromiseCreateParams) -> StorageResult<PromiseCreateResult> {
+    pub(crate) async fn promise_create(
+        &self,
+        params: &PromiseCreateParams<'_>,
+    ) -> StorageResult<PromiseCreateResult> {
         let PromiseCreateParams {
             id,
             state,
@@ -465,40 +548,45 @@ impl<'a> Db for SqliteDb<'a> {
             "INSERT OR IGNORE INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at, settled_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![id, state, param_headers, param_data, tags, timeout_at, created_at, settled_at],
-        )?;
+        ).await?;
 
         let was_created = inserted > 0;
         if was_created {
             if already_timedout {
                 // Already timed out — create fulfilled task if resonate:target
                 if address.is_some() {
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO tasks (id, state) VALUES (?1, 'fulfilled')",
-                        params![id],
-                    )?;
+                    self.conn
+                        .execute(
+                            "INSERT OR IGNORE INTO tasks (id, state) VALUES (?1, 'fulfilled')",
+                            params![id],
+                        )
+                        .await?;
                 }
             } else {
-                // Promise timeout
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO promise_timeouts (timeout_at, id) VALUES (?1, ?2)",
-                    params![timeout_at, id],
-                )?;
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO promise_timeouts (timeout_at, id) VALUES (?1, ?2)",
+                        params![timeout_at, id],
+                    )
+                    .await?;
                 // TaskInfraCreated
                 if let Some(addr) = address {
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO tasks (id, state) VALUES (?1, 'pending')",
-                        params![id],
-                    )?;
+                    self.conn
+                        .execute(
+                            "INSERT OR IGNORE INTO tasks (id, state) VALUES (?1, 'pending')",
+                            params![id],
+                        )
+                        .await?;
                     if self.conn.changes() > 0 {
                         self.conn.execute(
                             "INSERT OR IGNORE INTO task_timeouts (timeout_at, id, timeout_type, ttl) VALUES (?1, ?2, 0, ?3)",
                             params![created_at + self.task_retry_timeout, id, self.task_retry_timeout],
-                        )?;
+                        ).await?;
                         self.conn.execute(
                             "INSERT INTO outgoing_execute (id, version, address) VALUES (?1, 0, ?2)
                              ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address",
                             params![id, addr],
-                        )?;
+                        ).await?;
                     }
                 }
             }
@@ -506,11 +594,14 @@ impl<'a> Db for SqliteDb<'a> {
 
         Ok(PromiseCreateResult {
             was_created,
-            promise: self.promise_get(id)?.unwrap(),
+            promise: self.promise_get(id).await?.unwrap(),
         })
     }
 
-    fn promise_settle(&self, params: &PromiseSettleParams) -> StorageResult<PromiseSettleResult> {
+    pub(crate) async fn promise_settle(
+        &self,
+        params: &PromiseSettleParams<'_>,
+    ) -> StorageResult<PromiseSettleResult> {
         let PromiseSettleParams {
             id,
             state,
@@ -527,22 +618,23 @@ impl<'a> Db for SqliteDb<'a> {
             settled_at,
             settled_at,
             self.task_retry_timeout,
-        )?;
+        )
+        .await?;
 
         Ok(PromiseSettleResult {
             was_settled,
-            promise: self.promise_get(id)?,
+            promise: self.promise_get(id).await?,
         })
     }
 
-    fn promise_register_callback(
+    pub(crate) async fn promise_register_callback(
         &self,
         awaited_id: &str,
         awaiter_id: &str,
         time: i64,
     ) -> StorageResult<RegisterCallbackResult> {
-        let awaited = self.promise_get(awaited_id)?;
-        let awaiter = self.promise_get(awaiter_id)?;
+        let awaited = self.promise_get(awaited_id).await?;
+        let awaiter = self.promise_get(awaiter_id).await?;
 
         // Insert callback only if both pending and awaiter has target
         if let (Some(ref pa), Some(ref pw)) = (&awaited, &awaiter) {
@@ -550,10 +642,12 @@ impl<'a> Db for SqliteDb<'a> {
                 && pw.state == PromiseState::Pending
                 && pw.tags.contains_key("resonate:target")
             {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO callbacks (awaited_id, awaiter_id) VALUES (?1, ?2)",
-                    params![awaited_id, awaiter_id],
-                )?;
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO callbacks (awaited_id, awaiter_id) VALUES (?1, ?2)",
+                        params![awaited_id, awaiter_id],
+                    )
+                    .await?;
             }
         }
 
@@ -564,33 +658,31 @@ impl<'a> Db for SqliteDb<'a> {
                 let updated = self.conn.execute(
                     "UPDATE tasks SET state = 'pending' WHERE id = ?1 AND state = 'suspended'",
                     params![awaiter_id],
-                )?;
+                ).await?;
                 if updated > 0 {
-                    let version: i64 = self.conn.query_row(
+                    let version: i64 = scalar_i64(
+                        self.conn,
                         "SELECT version FROM tasks WHERE id = ?1",
                         params![awaiter_id],
-                        |r| r.get(0),
-                    )?;
+                    )
+                    .await?;
                     self.conn.execute(
                         "INSERT INTO task_timeouts (timeout_at, id, timeout_type, ttl) VALUES (?1, ?2, 0, ?3)
                          ON CONFLICT (id) DO UPDATE SET timeout_at = ?1, timeout_type = 0, process_id = NULL, ttl = ?3",
                         params![time + self.task_retry_timeout, awaiter_id, self.task_retry_timeout],
-                    )?;
-                    let target: Option<String> = self
-                        .conn
-                        .query_row(
-                            "SELECT target FROM promises WHERE id = ?1",
-                            params![awaiter_id],
-                            |r| r.get(0),
-                        )
-                        .ok()
-                        .flatten();
+                    ).await?;
+                    let target: Option<String> = opt_string_col0(
+                        self.conn,
+                        "SELECT target FROM promises WHERE id = ?1",
+                        params![awaiter_id],
+                    )
+                    .await;
                     if let Some(target) = target {
                         self.conn.execute(
                             "INSERT INTO outgoing_execute (id, version, address) VALUES (?1, ?2, ?3)
                              ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address",
                             params![awaiter_id, version, target],
-                        )?;
+                        ).await?;
                     }
                 }
 
@@ -602,38 +694,40 @@ impl<'a> Db for SqliteDb<'a> {
                        SELECT 1 FROM tasks WHERE id = ?2 AND state IN ('pending', 'acquired')
                      )",
                     params![awaited_id, awaiter_id],
-                )?;
+                ).await?;
             }
         }
 
         Ok(RegisterCallbackResult { awaited, awaiter })
     }
 
-    fn promise_register_listener(
+    pub(crate) async fn promise_register_listener(
         &self,
         awaited_id: &str,
         address: &str,
     ) -> StorageResult<Option<PromiseRecord>> {
-        let promise = self.promise_get(awaited_id)?;
+        let promise = self.promise_get(awaited_id).await?;
         if let Some(ref p) = promise {
             if p.state == PromiseState::Pending {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO listeners (promise_id, address) VALUES (?1, ?2)",
-                    params![awaited_id, address],
-                )?;
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO listeners (promise_id, address) VALUES (?1, ?2)",
+                        params![awaited_id, address],
+                    )
+                    .await?;
             }
         }
         Ok(promise)
     }
 
-    fn promise_search(
+    pub(crate) async fn promise_search(
         &self,
         state: Option<&str>,
         tags: Option<&str>,
         cursor: Option<&str>,
         limit: i64,
     ) -> StorageResult<Vec<PromiseRecord>> {
-        let mut stmt = self.conn.prepare(
+        let stmt = self.conn.prepare(
             "SELECT id, state, param_headers, param_data, value_headers, value_data, tags, timeout_at, created_at, settled_at
              FROM promises
              WHERE (?1 IS NULL OR state = ?1)
@@ -642,28 +736,28 @@ impl<'a> Db for SqliteDb<'a> {
                ))
                AND (?3 IS NULL OR id > ?3)
              ORDER BY id ASC LIMIT ?4",
-        )?;
-        let mut rows = stmt.query(params![state, tags, cursor, limit])?;
+        ).await?;
+        let mut rows = stmt.query(params![state, tags, cursor, limit]).await?;
         let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            results.push(row_to_promise(row)?);
+        while let Some(row) = rows.next().await? {
+            results.push(row_to_promise(&row)?);
         }
         Ok(results)
     }
 
-    fn task_get(&self, id: &str) -> StorageResult<Option<TaskRecord>> {
-        let mut stmt = self.conn.prepare(
+    pub(crate) async fn task_get(&self, id: &str) -> StorageResult<Option<TaskRecord>> {
+        let stmt = self.conn.prepare(
             "SELECT t.id, t.state, t.version,
                     CASE WHEN tt.timeout_type = 1 THEN tt.ttl ELSE NULL END,
                     CASE WHEN tt.timeout_type = 1 THEN tt.process_id ELSE NULL END
              FROM tasks t LEFT JOIN task_timeouts tt ON tt.id = t.id
              WHERE t.id = ?1",
-        )?;
-        let mut rows = stmt.query(params![id])?;
-        match rows.next()? {
+        ).await?;
+        let mut rows = stmt.query(params![id]).await?;
+        match rows.next().await? {
             Some(row) => {
                 let task_id: String = row.get(0)?;
-                let resumes = get_resumes(self.conn, &task_id)?;
+                let resumes = get_resumes(self.conn, &task_id).await?;
                 let state_str: String = row.get(1)?;
                 Ok(Some(TaskRecord {
                     id: task_id,
@@ -678,7 +772,10 @@ impl<'a> Db for SqliteDb<'a> {
         }
     }
 
-    fn task_create(&self, params: &TaskCreateParams) -> StorageResult<TaskCreateResult> {
+    pub(crate) async fn task_create(
+        &self,
+        params: &TaskCreateParams<'_>,
+    ) -> StorageResult<TaskCreateResult> {
         let TaskCreateParams {
             promise_id,
             state,
@@ -697,18 +794,21 @@ impl<'a> Db for SqliteDb<'a> {
             "INSERT OR IGNORE INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at, settled_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![promise_id, state, param_headers, param_data, tags, timeout_at, created_at, settled_at],
-        )? > 0;
+        ).await? > 0;
 
         let promise = self
-            .promise_get(promise_id)?
+            .promise_get(promise_id)
+            .await?
             .unwrap_or_else(|| unreachable!("promise missing after insert in task_create"));
 
         if promise_inserted {
             if !already_timedout {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO promise_timeouts (timeout_at, id) VALUES (?1, ?2)",
-                    params![timeout_at, promise_id],
-                )?;
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO promise_timeouts (timeout_at, id) VALUES (?1, ?2)",
+                        params![timeout_at, promise_id],
+                    )
+                    .await?;
             }
             let task_state = if already_timedout {
                 "fulfilled"
@@ -719,13 +819,13 @@ impl<'a> Db for SqliteDb<'a> {
             let inserted = self.conn.execute(
                 "INSERT OR IGNORE INTO tasks (id, state, version) VALUES (?1, ?2, ?3)",
                 params![promise_id, task_state, task_version],
-            )? > 0;
+            ).await? > 0;
             if inserted {
                 if !already_timedout {
                     self.conn.execute(
                         "INSERT OR REPLACE INTO task_timeouts (timeout_at, id, timeout_type, process_id, ttl) VALUES (?1, ?2, 1, ?3, ?4)",
                         params![created_at + ttl, promise_id, pid, ttl],
-                    )?;
+                    ).await?;
                 }
                 return Ok(TaskCreateResult {
                     promise,
@@ -739,7 +839,7 @@ impl<'a> Db for SqliteDb<'a> {
         // Promise already existed — do NOT acquire here.
         // The server handler will try to acquire as a separate step,
         // consistent with the PostgreSQL path.
-        let task_row = self.task_get(promise_id)?;
+        let task_row = self.task_get(promise_id).await?;
         Ok(TaskCreateResult {
             promise,
             task_created: false,
@@ -748,7 +848,10 @@ impl<'a> Db for SqliteDb<'a> {
         })
     }
 
-    fn task_acquire(&self, params: &TaskAcquireParams) -> StorageResult<TaskAcquireResult> {
+    pub(crate) async fn task_acquire(
+        &self,
+        params: &TaskAcquireParams<'_>,
+    ) -> StorageResult<TaskAcquireResult> {
         let TaskAcquireParams {
             task_id,
             version,
@@ -759,10 +862,10 @@ impl<'a> Db for SqliteDb<'a> {
         let updated = self.conn.execute(
             "UPDATE tasks SET state = 'acquired', version = version + 1 WHERE id = ?1 AND version = ?2 AND state = 'pending'",
             params![task_id, version],
-        )?;
+        ).await?;
 
-        let promise = self.promise_get(task_id)?;
-        let task = self.task_get(task_id)?;
+        let promise = self.promise_get(task_id).await?;
+        let task = self.task_get(task_id).await?;
         if promise.is_none() || task.is_none() {
             return Ok(TaskAcquireResult {
                 promise: None,
@@ -773,17 +876,19 @@ impl<'a> Db for SqliteDb<'a> {
         }
 
         if updated > 0 {
-            // Insert/update lease timeout
+            // Lease timeout (type 1)
             self.conn.execute(
                 "INSERT INTO task_timeouts (timeout_at, id, timeout_type, process_id, ttl) VALUES (?1, ?2, 1, ?3, ?4)
                  ON CONFLICT (id) DO UPDATE SET timeout_at = ?1, timeout_type = 1, process_id = ?3, ttl = ?4",
                 params![time + ttl, task_id, pid, ttl],
-            )?;
+            ).await?;
             // Clean up ready callbacks from previous suspension
-            self.conn.execute(
-                "DELETE FROM callbacks WHERE awaiter_id = ?1 AND ready = true",
-                params![task_id],
-            )?;
+            self.conn
+                .execute(
+                    "DELETE FROM callbacks WHERE awaiter_id = ?1 AND ready = true",
+                    params![task_id],
+                )
+                .await?;
         }
 
         let (task_state, task_version) =
@@ -796,7 +901,10 @@ impl<'a> Db for SqliteDb<'a> {
         })
     }
 
-    fn task_fence_create(&self, params: &TaskFenceCreateParams) -> StorageResult<TaskFenceResult> {
+    pub(crate) async fn task_fence_create(
+        &self,
+        params: &TaskFenceCreateParams<'_>,
+    ) -> StorageResult<TaskFenceResult> {
         let TaskFenceCreateParams {
             task_id,
             version,
@@ -811,8 +919,7 @@ impl<'a> Db for SqliteDb<'a> {
             already_timedout,
             address,
         } = *params;
-        // Fence check
-        let task = self.task_get(task_id)?;
+        let task = self.task_get(task_id).await?;
         let task_exists = task.is_some();
         let fence_ok = task.is_some_and(|t| t.state == TaskState::Acquired && t.version == version);
 
@@ -824,19 +931,20 @@ impl<'a> Db for SqliteDb<'a> {
             });
         }
 
-        // Execute inner promise.create
-        let result = self.promise_create(&PromiseCreateParams {
-            id: promise_id,
-            state,
-            param_headers,
-            param_data,
-            tags,
-            timeout_at,
-            created_at,
-            settled_at,
-            already_timedout,
-            address,
-        })?;
+        let result = self
+            .promise_create(&PromiseCreateParams {
+                id: promise_id,
+                state,
+                param_headers,
+                param_data,
+                tags,
+                timeout_at,
+                created_at,
+                settled_at,
+                already_timedout,
+                address,
+            })
+            .await?;
 
         Ok(TaskFenceResult {
             task_exists,
@@ -845,7 +953,10 @@ impl<'a> Db for SqliteDb<'a> {
         })
     }
 
-    fn task_fence_settle(&self, params: &TaskFenceSettleParams) -> StorageResult<TaskFenceResult> {
+    pub(crate) async fn task_fence_settle(
+        &self,
+        params: &TaskFenceSettleParams<'_>,
+    ) -> StorageResult<TaskFenceResult> {
         let TaskFenceSettleParams {
             task_id,
             version,
@@ -855,7 +966,7 @@ impl<'a> Db for SqliteDb<'a> {
             value_data,
             settled_at,
         } = *params;
-        let task = self.task_get(task_id)?;
+        let task = self.task_get(task_id).await?;
         let task_exists = task.is_some();
         let fence_ok = task.is_some_and(|t| t.state == TaskState::Acquired && t.version == version);
 
@@ -867,7 +978,6 @@ impl<'a> Db for SqliteDb<'a> {
             });
         }
 
-        // Execute settlement
         settle_promise(
             self.conn,
             promise_id,
@@ -877,9 +987,10 @@ impl<'a> Db for SqliteDb<'a> {
             settled_at,
             settled_at,
             self.task_retry_timeout,
-        )?;
+        )
+        .await?;
 
-        let promise = self.promise_get(promise_id)?;
+        let promise = self.promise_get(promise_id).await?;
         Ok(TaskFenceResult {
             task_exists,
             fence_ok,
@@ -887,7 +998,12 @@ impl<'a> Db for SqliteDb<'a> {
         })
     }
 
-    fn task_heartbeat(&self, pid: &str, tasks: &[(&str, i64)], time: i64) -> StorageResult<()> {
+    pub(crate) async fn task_heartbeat(
+        &self,
+        pid: &str,
+        tasks: &[(&str, i64)],
+        time: i64,
+    ) -> StorageResult<()> {
         for &(task_id, version) in tasks {
             if task_id.is_empty() {
                 continue;
@@ -905,19 +1021,18 @@ impl<'a> Db for SqliteDb<'a> {
                  WHERE id = ?2 AND process_id = ?3
                    AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = ?2 AND t.version = ?4 AND t.state = 'acquired')",
                 params![time, task_id, pid, version],
-            )?;
+            ).await?;
         }
         Ok(())
     }
 
-    fn task_suspend(
+    pub(crate) async fn task_suspend(
         &self,
         task_id: &str,
         version: i64,
         awaited_ids: &[&str],
     ) -> StorageResult<TaskSuspendResult> {
-        // Check task state
-        let task = self.task_get(task_id)?;
+        let task = self.task_get(task_id).await?;
         let task_matched = task
             .as_ref()
             .is_some_and(|t| t.state == TaskState::Acquired && t.version == version);
@@ -933,7 +1048,7 @@ impl<'a> Db for SqliteDb<'a> {
         let mut found_count = 0;
         let mut has_settled = false;
         for aid in awaited_ids {
-            if let Some(p) = self.promise_get(aid)? {
+            if let Some(p) = self.promise_get(aid).await? {
                 found_count += 1;
                 if p.state != PromiseState::Pending {
                     has_settled = true;
@@ -948,25 +1063,28 @@ impl<'a> Db for SqliteDb<'a> {
 
         if can_suspend {
             // Clear stale ready callbacks from a prior resume before registering new ones
-            self.conn.execute(
-                "DELETE FROM callbacks WHERE awaiter_id = ?1 AND ready = true",
-                params![task_id],
-            )?;
-            // Register callbacks for all awaited
+            self.conn
+                .execute(
+                    "DELETE FROM callbacks WHERE awaiter_id = ?1 AND ready = true",
+                    params![task_id],
+                )
+                .await?;
             for aid in awaited_ids {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO callbacks (awaited_id, awaiter_id) VALUES (?1, ?2)",
-                    params![aid, task_id],
-                )?;
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO callbacks (awaited_id, awaiter_id) VALUES (?1, ?2)",
+                        params![aid, task_id],
+                    )
+                    .await?;
             }
 
-            // Suspend the task
             self.conn.execute(
                 "UPDATE tasks SET state = 'suspended' WHERE id = ?1 AND version = ?2 AND state = 'acquired'",
                 params![task_id, version],
-            )?;
+            ).await?;
             self.conn
-                .execute("DELETE FROM task_timeouts WHERE id = ?1", params![task_id])?;
+                .execute("DELETE FROM task_timeouts WHERE id = ?1", params![task_id])
+                .await?;
 
             Ok(TaskSuspendResult {
                 task_matched: true,
@@ -975,10 +1093,12 @@ impl<'a> Db for SqliteDb<'a> {
             })
         } else if missing_count == 0 {
             // Immediate resume — has_settled is true, delete ready callbacks
-            self.conn.execute(
-                "DELETE FROM callbacks WHERE awaiter_id = ?1 AND ready = true",
-                params![task_id],
-            )?;
+            self.conn
+                .execute(
+                    "DELETE FROM callbacks WHERE awaiter_id = ?1 AND ready = true",
+                    params![task_id],
+                )
+                .await?;
             Ok(TaskSuspendResult {
                 task_matched: true,
                 was_suspended: false,
@@ -993,7 +1113,10 @@ impl<'a> Db for SqliteDb<'a> {
         }
     }
 
-    fn task_fulfill(&self, params: &TaskFulfillParams) -> StorageResult<TaskFulfillResult> {
+    pub(crate) async fn task_fulfill(
+        &self,
+        params: &TaskFulfillParams<'_>,
+    ) -> StorageResult<TaskFulfillResult> {
         let TaskFulfillParams {
             task_id,
             version,
@@ -1003,17 +1126,16 @@ impl<'a> Db for SqliteDb<'a> {
             value_data,
             settled_at,
         } = *params;
-        // Fulfill the task
         let task_fulfilled = self.conn.execute(
             "UPDATE tasks SET state = 'fulfilled' WHERE id = ?1 AND version = ?2 AND state = 'acquired'",
             params![task_id, version],
-        )? > 0;
+        ).await? > 0;
 
         if task_fulfilled {
             self.conn
-                .execute("DELETE FROM task_timeouts WHERE id = ?1", params![task_id])?;
+                .execute("DELETE FROM task_timeouts WHERE id = ?1", params![task_id])
+                .await?;
 
-            // Settle the promise
             settle_promise(
                 self.conn,
                 promise_id,
@@ -1023,28 +1145,31 @@ impl<'a> Db for SqliteDb<'a> {
                 settled_at,
                 settled_at,
                 self.task_retry_timeout,
-            )?;
+            )
+            .await?;
 
-            // Delete callbacks where this task is the awaiter
-            self.conn.execute(
-                "DELETE FROM callbacks WHERE awaiter_id = ?1",
-                params![task_id],
-            )?;
+            self.conn
+                .execute(
+                    "DELETE FROM callbacks WHERE awaiter_id = ?1",
+                    params![task_id],
+                )
+                .await?;
         }
 
-        let task_exists = self.conn.query_row(
+        let task_exists = scalar_bool(
+            self.conn,
             "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
             params![task_id],
-            |r| r.get::<_, bool>(0),
-        )?;
+        )
+        .await?;
         Ok(TaskFulfillResult {
             task_exists,
             task_fulfilled,
-            promise: self.promise_get(promise_id)?,
+            promise: self.promise_get(promise_id).await?,
         })
     }
 
-    fn task_release(
+    pub(crate) async fn task_release(
         &self,
         task_id: &str,
         version: i64,
@@ -1054,121 +1179,124 @@ impl<'a> Db for SqliteDb<'a> {
         let task_released = self.conn.execute(
             "UPDATE tasks SET state = 'pending' WHERE id = ?1 AND version = ?2 AND state = 'acquired'",
             params![task_id, version],
-        )? > 0;
+        ).await? > 0;
 
         if task_released {
             self.conn.execute(
                 "UPDATE task_timeouts SET timeout_type = 0, timeout_at = ?1, process_id = NULL WHERE id = ?2",
                 params![time + ttl, task_id],
-            )?;
-            // Insert outgoing execute
-            let new_version: i64 = self.conn.query_row(
+            ).await?;
+            let new_version: i64 = scalar_i64(
+                self.conn,
                 "SELECT version FROM tasks WHERE id = ?1",
                 params![task_id],
-                |r| r.get(0),
-            )?;
-            let target: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT target FROM promises WHERE id = ?1",
-                    params![task_id],
-                    |r| r.get(0),
-                )
-                .ok()
-                .flatten();
+            )
+            .await?;
+            let target: Option<String> = opt_string_col0(
+                self.conn,
+                "SELECT target FROM promises WHERE id = ?1",
+                params![task_id],
+            )
+            .await;
             if let Some(target) = target {
                 self.conn.execute(
                     "INSERT INTO outgoing_execute (id, version, address) VALUES (?1, ?2, ?3)
                      ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address",
                     params![task_id, new_version, target],
-                )?;
+                ).await?;
             }
         }
-        let task_exists = self.conn.query_row(
+        let task_exists = scalar_bool(
+            self.conn,
             "SELECT EXISTS (SELECT 1 FROM tasks WHERE id = ?1)",
             params![task_id],
-            |r| r.get(0),
-        )?;
+        )
+        .await?;
         Ok(TaskReleaseResult {
             task_released,
             task_exists,
         })
     }
 
-    fn task_halt(&self, task_id: &str) -> StorageResult<TaskHaltResult> {
+    pub(crate) async fn task_halt(&self, task_id: &str) -> StorageResult<TaskHaltResult> {
         self.conn.execute(
             "UPDATE tasks SET state = 'halted' WHERE id = ?1 AND state NOT IN ('fulfilled', 'halted')",
             params![task_id],
-        )?;
+        ).await?;
         self.conn.execute(
             "DELETE FROM task_timeouts WHERE id = ?1 AND EXISTS (SELECT 1 FROM tasks WHERE id = ?1 AND state = 'halted')",
             params![task_id],
-        )?;
-        let row = self.conn.query_row(
-            "SELECT
+        ).await?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
                EXISTS (SELECT 1 FROM tasks WHERE id = ?1) AS task_exists,
                EXISTS (SELECT 1 FROM tasks WHERE id = ?1 AND state = 'fulfilled') AS task_fulfilled",
-            params![task_id],
-            |r| Ok(TaskHaltResult {
-                task_exists: r.get(0)?,
-                task_fulfilled: r.get(1)?,
-            }),
-        )?;
-        Ok(row)
+            )
+            .await?;
+        let row = stmt.query_row(params![task_id]).await?;
+        Ok(TaskHaltResult {
+            task_exists: row.get(0)?,
+            task_fulfilled: row.get(1)?,
+        })
     }
 
-    fn task_continue(&self, task_id: &str, time: i64) -> StorageResult<TaskContinueResult> {
+    pub(crate) async fn task_continue(
+        &self,
+        task_id: &str,
+        time: i64,
+    ) -> StorageResult<TaskContinueResult> {
         let continued = self.conn.execute(
             "UPDATE tasks SET state = 'pending' WHERE id = ?1 AND state = 'halted'",
             params![task_id],
-        )? > 0;
+        ).await? > 0;
 
         if continued {
             self.conn.execute(
                 "INSERT INTO task_timeouts (timeout_at, id, timeout_type, ttl) VALUES (?1, ?2, 0, ?3) ON CONFLICT (id) DO NOTHING",
                 params![time + self.task_retry_timeout, task_id, self.task_retry_timeout],
-            )?;
-            let version: i64 = self.conn.query_row(
+            ).await?;
+            let version: i64 = scalar_i64(
+                self.conn,
                 "SELECT version FROM tasks WHERE id = ?1",
                 params![task_id],
-                |r| r.get(0),
-            )?;
-            let target: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT target FROM promises WHERE id = ?1",
-                    params![task_id],
-                    |r| r.get(0),
-                )
-                .ok()
-                .flatten();
+            )
+            .await?;
+            let target: Option<String> = opt_string_col0(
+                self.conn,
+                "SELECT target FROM promises WHERE id = ?1",
+                params![task_id],
+            )
+            .await;
             if let Some(target) = target {
                 self.conn.execute(
                     "INSERT INTO outgoing_execute (id, version, address) VALUES (?1, ?2, ?3)
                      ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address",
                     params![task_id, version, target],
-                )?;
+                ).await?;
             }
         }
 
-        let task_exists: bool = self.conn.query_row(
+        let task_exists: bool = scalar_bool(
+            self.conn,
             "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
             params![task_id],
-            |r| r.get(0),
-        )?;
+        )
+        .await?;
         Ok(TaskContinueResult {
             task_exists,
             continued,
         })
     }
 
-    fn task_search(
+    pub(crate) async fn task_search(
         &self,
         state: Option<&str>,
         cursor: Option<&str>,
         limit: i64,
     ) -> StorageResult<Vec<TaskRecord>> {
-        let mut stmt = self.conn.prepare(
+        let stmt = self.conn.prepare(
             "SELECT t.id, t.state, t.version,
                     CASE WHEN tt.timeout_type = 1 THEN tt.ttl ELSE NULL END,
                     CASE WHEN tt.timeout_type = 1 THEN tt.process_id ELSE NULL END,
@@ -1176,61 +1304,64 @@ impl<'a> Db for SqliteDb<'a> {
              FROM tasks t LEFT JOIN task_timeouts tt ON tt.id = t.id
              WHERE (?1 IS NULL OR t.state = ?1) AND (?2 IS NULL OR t.id > ?2)
              ORDER BY t.id ASC LIMIT ?3",
-        )?;
-        let mut rows = stmt.query(params![state, cursor, limit])?;
+        ).await?;
+        let mut rows = stmt.query(params![state, cursor, limit]).await?;
         let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().await? {
             let state_str: String = row.get(1)?;
             results.push(TaskRecord {
                 id: row.get(0)?,
                 state: parse_task_state(&state_str),
                 version: row.get(2)?,
-                ttl: row.get::<_, Option<i64>>(3).ok().flatten(),
-                pid: row.get::<_, Option<String>>(4).ok().flatten(),
+                ttl: row.get::<Option<i64>>(3).ok().flatten(),
+                pid: row.get::<Option<String>>(4).ok().flatten(),
                 resumes: row.get(5)?,
             });
         }
         Ok(results)
     }
 
-    fn compute_preload(&self, promise_id: &str) -> StorageResult<Vec<PromiseRecord>> {
-        let branch: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT branch FROM promises WHERE id = ?1",
-                params![promise_id],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten();
+    pub(crate) async fn compute_preload(
+        &self,
+        promise_id: &str,
+    ) -> StorageResult<Vec<PromiseRecord>> {
+        let branch: Option<String> = opt_string_col0(
+            self.conn,
+            "SELECT branch FROM promises WHERE id = ?1",
+            params![promise_id],
+        )
+        .await;
         let branch = match branch {
             Some(b) => b,
             None => return Ok(Vec::new()),
         };
-        let mut stmt = self.conn.prepare(
+        let stmt = self.conn.prepare(
             "SELECT id, state, param_headers, param_data, value_headers, value_data, tags, timeout_at, created_at, settled_at
              FROM promises WHERE branch = ?1 AND id != ?2 ORDER BY id ASC",
-        )?;
-        let mut rows = stmt.query(params![branch, promise_id])?;
+        ).await?;
+        let mut rows = stmt.query(params![branch, promise_id]).await?;
         let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            results.push(row_to_promise(row)?);
+        while let Some(row) = rows.next().await? {
+            results.push(row_to_promise(&row)?);
         }
         Ok(results)
     }
 
-    fn schedule_get(&self, id: &str) -> StorageResult<Option<ScheduleRecord>> {
-        let mut stmt = self.conn.prepare(
+    pub(crate) async fn schedule_get(&self, id: &str) -> StorageResult<Option<ScheduleRecord>> {
+        let stmt = self.conn.prepare(
             "SELECT id, cron, promise_id, promise_timeout, promise_param_headers, promise_param_data, promise_tags, created_at, next_run_at, last_run_at FROM schedules WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query(params![id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row_to_schedule(row)?)),
+        ).await?;
+        let mut rows = stmt.query(params![id]).await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row_to_schedule(&row)?)),
             None => Ok(None),
         }
     }
 
-    fn schedule_create(&self, params: &ScheduleCreateParams) -> StorageResult<ScheduleRecord> {
+    pub(crate) async fn schedule_create(
+        &self,
+        params: &ScheduleCreateParams<'_>,
+    ) -> StorageResult<ScheduleRecord> {
         let ScheduleCreateParams {
             id,
             cron,
@@ -1246,48 +1377,55 @@ impl<'a> Db for SqliteDb<'a> {
             "INSERT OR IGNORE INTO schedules (id, cron, promise_id, promise_timeout, promise_param_headers, promise_param_data, promise_tags, created_at, next_run_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![id, cron, promise_id, promise_timeout, promise_param_headers, promise_param_data, promise_tags, created_at, next_run_at],
-        )?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO schedule_timeouts (timeout_at, id) VALUES (?1, ?2)",
-            params![next_run_at, id],
-        )?;
-        Ok(self.schedule_get(id)?.unwrap())
+        ).await?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO schedule_timeouts (timeout_at, id) VALUES (?1, ?2)",
+                params![next_run_at, id],
+            )
+            .await?;
+        Ok(self.schedule_get(id).await?.unwrap())
     }
 
-    fn schedule_delete(&self, id: &str) -> StorageResult<bool> {
+    pub(crate) async fn schedule_delete(&self, id: &str) -> StorageResult<bool> {
         Ok(self
             .conn
-            .execute("DELETE FROM schedules WHERE id = ?1", params![id])?
+            .execute("DELETE FROM schedules WHERE id = ?1", params![id])
+            .await?
             > 0)
     }
 
-    fn schedule_search(
+    pub(crate) async fn schedule_search(
         &self,
         tags: Option<&str>,
         cursor: Option<&str>,
         limit: i64,
     ) -> StorageResult<Vec<ScheduleRecord>> {
-        let mut stmt = self.conn.prepare(
+        let stmt = self.conn.prepare(
             "SELECT id, cron, promise_id, promise_timeout, promise_param_headers, promise_param_data, promise_tags, created_at, next_run_at, last_run_at
              FROM schedules WHERE (?1 IS NULL OR NOT EXISTS (
                SELECT key, value FROM json_each(?1) EXCEPT SELECT key, value FROM json_each(promise_tags)
              )) AND (?2 IS NULL OR id > ?2) ORDER BY id ASC LIMIT ?3",
-        )?;
-        let mut rows = stmt.query(params![tags, cursor, limit])?;
+        ).await?;
+        let mut rows = stmt.query(params![tags, cursor, limit]).await?;
         let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            results.push(row_to_schedule(row)?);
+        while let Some(row) = rows.next().await? {
+            results.push(row_to_schedule(&row)?);
         }
         Ok(results)
     }
 
-    fn get_expired_schedule_timeouts(&self, time: i64) -> StorageResult<Vec<(String, i64)>> {
-        let mut stmt = self
+    pub(crate) async fn get_expired_schedule_timeouts(
+        &self,
+        time: i64,
+    ) -> StorageResult<Vec<(String, i64)>> {
+        let stmt = self
             .conn
-            .prepare("SELECT id, timeout_at FROM schedule_timeouts WHERE timeout_at <= ?1")?;
-        let mut rows = stmt.query(params![time])?;
+            .prepare("SELECT id, timeout_at FROM schedule_timeouts WHERE timeout_at <= ?1")
+            .await?;
+        let mut rows = stmt.query(params![time]).await?;
         let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().await? {
             let id: String = row.get(0)?;
             let timeout_at: i64 = row.get(1)?;
             results.push((id, timeout_at));
@@ -1295,7 +1433,7 @@ impl<'a> Db for SqliteDb<'a> {
         Ok(results)
     }
 
-    fn process_schedule_timeout(
+    pub(crate) async fn process_schedule_timeout(
         &self,
         schedule_id: &str,
         fired_at: i64,
@@ -1304,17 +1442,19 @@ impl<'a> Db for SqliteDb<'a> {
         promise_tags: &std::collections::HashMap<String, String>,
     ) -> StorageResult<Option<ScheduleRecord>> {
         // Step 1: Guard check — idempotency
-        let guard_exists: bool = self.conn.query_row(
+        let guard_exists: bool = scalar_i64(
+            self.conn,
             "SELECT COUNT(*) FROM schedule_timeouts WHERE id = ?1 AND timeout_at = ?2",
             params![schedule_id, fired_at],
-            |row| row.get::<_, i64>(0),
-        )? > 0;
+        )
+        .await?
+            > 0;
         if !guard_exists {
             return Ok(None);
         }
 
         // Step 2: Fetch schedule
-        let schedule = match self.schedule_get(schedule_id)? {
+        let schedule = match self.schedule_get(schedule_id).await? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -1327,6 +1467,7 @@ impl<'a> Db for SqliteDb<'a> {
             .promise_id
             .replace("{{.id}}", &schedule.id)
             .replace("{{.timestamp}}", &fired_at.to_string());
+        let promise_id = promise_id.as_str();
         let promise_timeout_at = fired_at + schedule.promise_timeout;
         let already_timedout = time >= promise_timeout_at;
         let is_timer = promise_tags.get("resonate:timer").map(|v| v.as_str()) == Some("true");
@@ -1351,87 +1492,100 @@ impl<'a> Db for SqliteDb<'a> {
         self.conn.execute(
             "INSERT OR IGNORE INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at, settled_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![promise_id, state, ph, schedule.promise_param.data, tags_json, promise_timeout_at, created_at, settled_at],
-        )?;
+            params![promise_id, state, ph, schedule.promise_param.data.as_deref(), tags_json, promise_timeout_at, created_at, settled_at],
+        ).await?;
         let promise_inserted = self.conn.changes() > 0;
 
         if promise_inserted {
             if already_timedout {
                 // Promise is immediately settled — create fulfilled task if resonate:target is set
                 if address.is_some() {
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO tasks (id, state) VALUES (?1, 'fulfilled')",
-                        params![promise_id],
-                    )?;
+                    self.conn
+                        .execute(
+                            "INSERT OR IGNORE INTO tasks (id, state) VALUES (?1, 'fulfilled')",
+                            params![promise_id],
+                        )
+                        .await?;
                 }
             } else {
                 // Step 6: Create promise_timeout
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO promise_timeouts (timeout_at, id) VALUES (?1, ?2)",
-                    params![promise_timeout_at, promise_id],
-                )?;
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO promise_timeouts (timeout_at, id) VALUES (?1, ?2)",
+                        params![promise_timeout_at, promise_id],
+                    )
+                    .await?;
 
                 // Step 7: Create task infrastructure if resonate:target is set
-                if let Some(addr) = &address {
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO tasks (id, state) VALUES (?1, 'pending')",
-                        params![promise_id],
-                    )?;
+                if let Some(addr) = address.as_deref() {
+                    self.conn
+                        .execute(
+                            "INSERT OR IGNORE INTO tasks (id, state) VALUES (?1, 'pending')",
+                            params![promise_id],
+                        )
+                        .await?;
                     if self.conn.changes() > 0 {
                         self.conn.execute(
                             "INSERT OR IGNORE INTO task_timeouts (timeout_at, id, timeout_type, ttl) VALUES (?1, ?2, 0, ?3)",
                             params![fired_at + self.task_retry_timeout, promise_id, self.task_retry_timeout],
-                        )?;
+                        ).await?;
                         self.conn.execute(
                             "INSERT INTO outgoing_execute (id, version, address) VALUES (?1, 0, ?2)
                              ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address",
                             params![promise_id, addr],
-                        )?;
+                        ).await?;
                     }
                 }
             }
         }
 
         // Step 8: Advance schedule
-        self.conn.execute(
-            "UPDATE schedules SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
-            params![fired_at, next_run_at, schedule_id],
-        )?;
+        self.conn
+            .execute(
+                "UPDATE schedules SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
+                params![fired_at, next_run_at, schedule_id],
+            )
+            .await?;
 
         // Step 9: Advance schedule_timeout
-        self.conn.execute(
-            "UPDATE schedule_timeouts SET timeout_at = ?1 WHERE id = ?2",
-            params![next_run_at, schedule_id],
-        )?;
+        self.conn
+            .execute(
+                "UPDATE schedule_timeouts SET timeout_at = ?1 WHERE id = ?2",
+                params![next_run_at, schedule_id],
+            )
+            .await?;
 
         // Step 10: Return updated schedule
-        self.schedule_get(schedule_id)
+        self.schedule_get(schedule_id).await
     }
 
-    fn ping(&self) -> StorageResult<()> {
-        self.conn.execute_batch("SELECT 1")?;
+    #[allow(dead_code)] // storage readiness probe — part of the vendored API surface
+    pub(crate) async fn ping(&self) -> StorageResult<()> {
+        self.conn.execute_batch("SELECT 1").await?;
         Ok(())
     }
 
-    fn debug_reset(&self) -> StorageResult<()> {
-        self.conn.execute_batch(
-            "DELETE FROM outgoing_unblock; DELETE FROM outgoing_execute;
+    pub(crate) async fn debug_reset(&self) -> StorageResult<()> {
+        self.conn
+            .execute_batch(
+                "DELETE FROM outgoing_unblock; DELETE FROM outgoing_execute;
              DELETE FROM task_timeouts; DELETE FROM listeners; DELETE FROM callbacks;
              DELETE FROM promise_timeouts; DELETE FROM tasks; DELETE FROM promises;
              DELETE FROM schedule_timeouts; DELETE FROM schedules;",
-        )?;
+            )
+            .await?;
         Ok(())
     }
 
-    fn process_timeouts(&self, time: i64) -> StorageResult<()> {
+    pub(crate) async fn process_timeouts(&self, time: i64) -> StorageResult<()> {
         // Statement 1: Process expired promise timeouts
-        let mut stmt = self.conn.prepare(
+        let stmt = self.conn.prepare(
             "SELECT id, timer, timeout_at FROM promises WHERE state = 'pending' AND timeout_at <= ?1"
-        )?;
+        ).await?;
         let expired: Vec<(String, bool, i64)> = {
-            let mut rows = stmt.query(params![time])?;
+            let mut rows = stmt.query(params![time]).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 r.push((row.get(0)?, row.get(1)?, row.get(2)?));
             }
             r
@@ -1440,6 +1594,7 @@ impl<'a> Db for SqliteDb<'a> {
         // Phase 1: Settle all expired promises
         let mut fulfilled_ids = Vec::new();
         for (id, timer, timeout_at) in &expired {
+            let id = id.as_str();
             let new_state = if *timer {
                 "resolved"
             } else {
@@ -1448,14 +1603,15 @@ impl<'a> Db for SqliteDb<'a> {
             self.conn.execute(
                 "UPDATE promises SET state = ?2, settled_at = ?3 WHERE id = ?1 AND state = 'pending'",
                 params![id, new_state, timeout_at],
-            )?;
+            ).await?;
             self.conn
-                .execute("DELETE FROM promise_timeouts WHERE id = ?1", params![id])?;
+                .execute("DELETE FROM promise_timeouts WHERE id = ?1", params![id])
+                .await?;
         }
 
         // Phase 2: SettlementEnqueued for all
         for (id, _, _) in &expired {
-            if settlement_enqueued(self.conn, id)? {
+            if settlement_enqueued(self.conn, id).await? {
                 fulfilled_ids.push(id.clone());
             }
         }
@@ -1468,125 +1624,130 @@ impl<'a> Db for SqliteDb<'a> {
                 time,
                 self.task_retry_timeout,
                 Some(&fulfilled_ids),
-            )?;
-            listener_unblocked(self.conn, id)?;
+            )
+            .await?;
+            listener_unblocked(self.conn, id).await?;
         }
 
         // Statement 2: Process expired task retry timeouts (type 0)
-        let mut stmt = self.conn.prepare(
-            "SELECT tt.id FROM task_timeouts tt JOIN tasks t ON t.id = tt.id
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT tt.id FROM task_timeouts tt JOIN tasks t ON t.id = tt.id
              WHERE tt.timeout_type = 0 AND tt.timeout_at <= ?1 AND t.state = 'pending'",
-        )?;
+            )
+            .await?;
         let retry_ids: Vec<String> = {
-            let mut rows = stmt.query(params![time])?;
+            let mut rows = stmt.query(params![time]).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 r.push(row.get(0)?);
             }
             r
         };
 
         for id in &retry_ids {
+            let id = id.as_str();
             self.conn.execute(
                 "UPDATE task_timeouts SET timeout_at = ?1 + ?3, process_id = NULL WHERE id = ?2",
                 params![time, id, self.task_retry_timeout],
-            )?;
-            let version: i64 = self
-                .conn
-                .query_row(
-                    "SELECT version FROM tasks WHERE id = ?1",
-                    params![id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let target: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT target FROM promises WHERE id = ?1",
-                    params![id],
-                    |r| r.get(0),
-                )
-                .ok()
-                .flatten();
+            ).await?;
+            let version: i64 = scalar_i64(
+                self.conn,
+                "SELECT version FROM tasks WHERE id = ?1",
+                params![id],
+            )
+            .await
+            .unwrap_or(0);
+            let target: Option<String> = opt_string_col0(
+                self.conn,
+                "SELECT target FROM promises WHERE id = ?1",
+                params![id],
+            )
+            .await;
             if let Some(target) = target {
                 self.conn.execute(
                     "INSERT INTO outgoing_execute (id, version, address) VALUES (?1, ?2, ?3)
                      ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address",
                     params![id, version, target],
-                )?;
+                ).await?;
             }
         }
 
         // Statement 3: Process expired task lease timeouts (type 1)
-        let mut stmt = self.conn.prepare(
-            "SELECT tt.id FROM task_timeouts tt JOIN tasks t ON t.id = tt.id
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT tt.id FROM task_timeouts tt JOIN tasks t ON t.id = tt.id
              WHERE tt.timeout_type = 1 AND tt.timeout_at <= ?1 AND t.state = 'acquired'",
-        )?;
+            )
+            .await?;
         let lease_ids: Vec<String> = {
-            let mut rows = stmt.query(params![time])?;
+            let mut rows = stmt.query(params![time]).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 r.push(row.get(0)?);
             }
             r
         };
 
         for id in &lease_ids {
-            self.conn.execute(
-                "UPDATE tasks SET state = 'pending' WHERE id = ?1",
-                params![id],
-            )?;
-            let version: i64 = self
-                .conn
-                .query_row(
-                    "SELECT version FROM tasks WHERE id = ?1",
+            let id = id.as_str();
+            self.conn
+                .execute(
+                    "UPDATE tasks SET state = 'pending' WHERE id = ?1",
                     params![id],
-                    |r| r.get(0),
                 )
-                .unwrap_or(0);
+                .await?;
+            let version: i64 = scalar_i64(
+                self.conn,
+                "SELECT version FROM tasks WHERE id = ?1",
+                params![id],
+            )
+            .await
+            .unwrap_or(0);
             self.conn.execute(
                 "UPDATE task_timeouts SET timeout_at = ?1 + ?3, timeout_type = 0, process_id = NULL, ttl = ?3 WHERE id = ?2",
                 params![time, id, self.task_retry_timeout],
-            )?;
-            let target: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT target FROM promises WHERE id = ?1",
-                    params![id],
-                    |r| r.get(0),
-                )
-                .ok()
-                .flatten();
+            ).await?;
+            let target: Option<String> = opt_string_col0(
+                self.conn,
+                "SELECT target FROM promises WHERE id = ?1",
+                params![id],
+            )
+            .await;
             if let Some(target) = target {
                 self.conn.execute(
                     "INSERT INTO outgoing_execute (id, version, address) VALUES (?1, ?2, ?3)
                      ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, address = EXCLUDED.address",
                     params![id, version, target],
-                )?;
+                ).await?;
             }
         }
 
         Ok(())
     }
 
-    fn snap(&self) -> StorageResult<Snapshot> {
+    pub(crate) async fn snap(&self) -> StorageResult<Snapshot> {
         let conn = self.conn;
 
-        let mut stmt = conn.prepare("SELECT id, state, param_headers, param_data, value_headers, value_data, tags, timeout_at, created_at, settled_at FROM promises ORDER BY id")?;
+        let stmt = conn.prepare("SELECT id, state, param_headers, param_data, value_headers, value_data, tags, timeout_at, created_at, settled_at FROM promises ORDER BY id").await?;
         let promises: Vec<PromiseRecord> = {
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(()).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
-                r.push(row_to_promise(row)?);
+            while let Some(row) = rows.next().await? {
+                r.push(row_to_promise(&row)?);
             }
             r
         };
 
-        let mut stmt = conn.prepare("SELECT id, timeout_at FROM promise_timeouts ORDER BY id")?;
+        let stmt = conn
+            .prepare("SELECT id, timeout_at FROM promise_timeouts ORDER BY id")
+            .await?;
         let promise_timeouts: Vec<SnapshotPromiseTimeout> = {
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(()).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 r.push(SnapshotPromiseTimeout {
                     id: row.get(0)?,
                     timeout: row.get(1)?,
@@ -1595,11 +1756,13 @@ impl<'a> Db for SqliteDb<'a> {
             r
         };
 
-        let mut stmt = conn.prepare("SELECT awaiter_id, awaited_id FROM callbacks WHERE NOT ready ORDER BY awaiter_id, awaited_id")?;
+        let stmt = conn
+            .prepare("SELECT awaiter_id, awaited_id FROM callbacks WHERE NOT ready ORDER BY awaiter_id, awaited_id")
+            .await?;
         let callbacks: Vec<SnapshotCallback> = {
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(()).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 r.push(SnapshotCallback {
                     awaiter: row.get(0)?,
                     awaited: row.get(1)?,
@@ -1608,12 +1771,13 @@ impl<'a> Db for SqliteDb<'a> {
             r
         };
 
-        let mut stmt =
-            conn.prepare("SELECT promise_id, address FROM listeners ORDER BY promise_id, address")?;
+        let stmt = conn
+            .prepare("SELECT promise_id, address FROM listeners ORDER BY promise_id, address")
+            .await?;
         let listeners: Vec<SnapshotListener> = {
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(()).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 r.push(SnapshotListener {
                     promise_id: row.get(0)?,
                     address: row.get(1)?,
@@ -1622,18 +1786,18 @@ impl<'a> Db for SqliteDb<'a> {
             r
         };
 
-        let mut stmt = conn.prepare(
+        let stmt = conn.prepare(
             "SELECT t.id, t.state, t.version,
                     CASE WHEN tt.timeout_type = 1 THEN tt.ttl ELSE NULL END,
                     CASE WHEN tt.timeout_type = 1 THEN tt.process_id ELSE NULL END
              FROM tasks t LEFT JOIN task_timeouts tt ON tt.id = t.id ORDER BY t.id",
-        )?;
+        ).await?;
         let tasks: Vec<TaskRecord> = {
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(()).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 let task_id: String = row.get(0)?;
-                let resumes = get_resumes(conn, &task_id)?;
+                let resumes = get_resumes(conn, &task_id).await?;
                 let state_str: String = row.get(1)?;
                 r.push(TaskRecord {
                     id: task_id,
@@ -1647,12 +1811,13 @@ impl<'a> Db for SqliteDb<'a> {
             r
         };
 
-        let mut stmt =
-            conn.prepare("SELECT id, timeout_type, timeout_at FROM task_timeouts ORDER BY id")?;
+        let stmt = conn
+            .prepare("SELECT id, timeout_type, timeout_at FROM task_timeouts ORDER BY id")
+            .await?;
         let task_timeouts: Vec<SnapshotTaskTimeout> = {
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(()).await?;
             let mut r = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().await? {
                 r.push(SnapshotTaskTimeout {
                     id: row.get(0)?,
                     timeout_type: row.get(1)?,
@@ -1664,11 +1829,12 @@ impl<'a> Db for SqliteDb<'a> {
 
         let mut messages: Vec<SnapshotMessage> = Vec::new();
 
-        let mut stmt =
-            conn.prepare("SELECT id, version, address FROM outgoing_execute ORDER BY id")?;
+        let stmt = conn
+            .prepare("SELECT id, version, address FROM outgoing_execute ORDER BY id")
+            .await?;
         {
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
+            let mut rows = stmt.query(()).await?;
+            while let Some(row) = rows.next().await? {
                 let id: String = row.get(0)?;
                 let version: i64 = row.get(1)?;
                 let address: String = row.get(2)?;
@@ -1676,16 +1842,16 @@ impl<'a> Db for SqliteDb<'a> {
             }
         }
 
-        let mut stmt = conn.prepare(
+        let stmt = conn.prepare(
             "SELECT ou.promise_id, ou.address, p.id, p.state, p.param_headers, p.param_data, p.value_headers, p.value_data, p.tags, p.timeout_at, p.created_at, p.settled_at
              FROM outgoing_unblock ou JOIN promises p ON p.id = ou.promise_id ORDER BY ou.promise_id, ou.address"
-        )?;
+        ).await?;
         {
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
+            let mut rows = stmt.query(()).await?;
+            while let Some(row) = rows.next().await? {
                 let _promise_id: String = row.get(0)?;
                 let address: String = row.get(1)?;
-                let promise = row_to_promise_offset(row, 2)?;
+                let promise = row_to_promise_offset(&row, 2)?;
                 messages.push(SnapshotMessage { address, message: serde_json::json!({ "kind": "unblock", "head": {}, "data": { "promise": promise } }) });
             }
         }
@@ -1701,18 +1867,18 @@ impl<'a> Db for SqliteDb<'a> {
         })
     }
 
-    fn take_outgoing(
+    pub(crate) async fn take_outgoing(
         &self,
         batch_size: i64,
     ) -> StorageResult<(Vec<OutgoingExecute>, Vec<OutgoingUnblock>)> {
         // Atomically delete and return a batch of execute messages
         let mut execute_msgs = Vec::new();
         {
-            let mut stmt = self.conn.prepare(
+            let stmt = self.conn.prepare(
                 "DELETE FROM outgoing_execute WHERE rowid IN (SELECT rowid FROM outgoing_execute LIMIT ?1) RETURNING id, version, address"
-            )?;
-            let mut rows = stmt.query(params![batch_size])?;
-            while let Some(row) = rows.next()? {
+            ).await?;
+            let mut rows = stmt.query(params![batch_size]).await?;
+            while let Some(row) = rows.next().await? {
                 execute_msgs.push(OutgoingExecute {
                     id: row.get(0)?,
                     version: row.get(1)?,
@@ -1726,23 +1892,23 @@ impl<'a> Db for SqliteDb<'a> {
         // within the same transaction: DELETE RETURNING, then SELECT per row.
         let mut deleted_unblocks: Vec<(String, String)> = Vec::new();
         {
-            let mut stmt = self.conn.prepare(
+            let stmt = self.conn.prepare(
                 "DELETE FROM outgoing_unblock WHERE rowid IN (SELECT rowid FROM outgoing_unblock LIMIT ?1) RETURNING promise_id, address"
-            )?;
-            let mut rows = stmt.query(params![batch_size])?;
-            while let Some(row) = rows.next()? {
+            ).await?;
+            let mut rows = stmt.query(params![batch_size]).await?;
+            while let Some(row) = rows.next().await? {
                 deleted_unblocks.push((row.get(0)?, row.get(1)?));
             }
         }
 
         let mut unblock_msgs = Vec::new();
         for (promise_id, address) in deleted_unblocks {
-            let mut stmt = self.conn.prepare(
+            let stmt = self.conn.prepare(
                 "SELECT id, state, param_headers, param_data, value_headers, value_data, tags, timeout_at, created_at, settled_at FROM promises WHERE id = ?1"
-            )?;
-            let mut rows = stmt.query(params![promise_id])?;
-            if let Some(row) = rows.next()? {
-                let promise = row_to_promise_offset(row, 0)?;
+            ).await?;
+            let mut rows = stmt.query(params![promise_id]).await?;
+            if let Some(row) = rows.next().await? {
+                let promise = row_to_promise_offset(&row, 0)?;
                 unblock_msgs.push(OutgoingUnblock { address, promise });
             }
         }
@@ -1752,21 +1918,22 @@ impl<'a> Db for SqliteDb<'a> {
 }
 
 /// Get resumes count (number of ready callbacks) for a task
-fn get_resumes(tx: &rusqlite::Connection, task_id: &str) -> rusqlite::Result<i64> {
-    tx.query_row(
+async fn get_resumes(tx: &Connection, task_id: &str) -> libsql::Result<i64> {
+    scalar_i64(
+        tx,
         "SELECT COUNT(*) FROM callbacks WHERE awaiter_id = ?1 AND ready = true",
         params![task_id],
-        |row| row.get(0),
     )
+    .await
 }
 
 // === Row mapping helpers ===
 
-fn row_to_promise(row: &rusqlite::Row) -> rusqlite::Result<PromiseRecord> {
+fn row_to_promise(row: &libsql::Row) -> libsql::Result<PromiseRecord> {
     row_to_promise_offset(row, 0)
 }
 
-fn row_to_promise_offset(row: &rusqlite::Row, offset: usize) -> rusqlite::Result<PromiseRecord> {
+fn row_to_promise_offset(row: &libsql::Row, offset: i32) -> libsql::Result<PromiseRecord> {
     let param_headers: Option<String> = row.get(offset + 2)?;
     let param_data: Option<String> = row.get(offset + 3)?;
     let value_headers: Option<String> = row.get(offset + 4)?;
@@ -1792,7 +1959,7 @@ fn row_to_promise_offset(row: &rusqlite::Row, offset: usize) -> rusqlite::Result
     })
 }
 
-fn row_to_schedule(row: &rusqlite::Row) -> rusqlite::Result<ScheduleRecord> {
+fn row_to_schedule(row: &libsql::Row) -> libsql::Result<ScheduleRecord> {
     let param_headers: Option<String> = row.get(4)?;
     let param_data: Option<String> = row.get(5)?;
     let tags_str: String = row.get(6)?;

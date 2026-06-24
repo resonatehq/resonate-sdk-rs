@@ -1,21 +1,19 @@
-//! Storage abstraction — vendored from `resonate/src/persistence/mod.rs`.
+//! Storage types — vendored from `resonate/src/persistence/mod.rs`.
 //!
-//! Trimmed to the SQLite backend only: the `Db` trait, its parameter/result
-//! structs, and a `Storage` enum with a single `Sqlite` variant. The Postgres
-//! and MySQL backends (and the `sqlx`-specific error mapping) are omitted.
+//! Trimmed to the libsql (SQLite) backend only: the parameter/result structs and
+//! the `StorageError` type. The upstream `Db` trait and multi-backend `Storage`
+//! enum are dropped — there is a single concrete backend ([`super::persistence_sqlite::SqliteStorage`]),
+//! so its methods live as inherent `async fn`s on the concrete type.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-
-use super::persistence_sqlite;
-use super::types::{PromiseRecord, ScheduleRecord, Snapshot, TaskRecord, TaskState};
+use super::types::{PromiseRecord, TaskState};
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
 #[derive(Debug)]
 pub enum StorageError {
     /// A backend-agnostic storage error. Carries the formatted error message
-    /// without exposing the underlying driver type (rusqlite, sqlx, etc.).
+    /// without exposing the underlying driver type (libsql, sqlx, etc.).
     Backend(String),
     /// Serialization conflict — retries exhausted, nothing was committed.
     /// The caller should return 503 (not 500) to indicate a retriable no-op.
@@ -35,8 +33,8 @@ impl std::fmt::Display for StorageError {
     }
 }
 
-impl From<rusqlite::Error> for StorageError {
-    fn from(e: rusqlite::Error) -> Self {
+impl From<libsql::Error> for StorageError {
+    fn from(e: libsql::Error) -> Self {
         StorageError::Backend(e.to_string())
     }
 }
@@ -121,7 +119,7 @@ pub struct OutgoingUnblock {
     pub promise: PromiseRecord,
 }
 
-// === Parameter structs for Db trait methods ===
+// === Parameter structs for Db methods ===
 
 pub struct PromiseCreateParams<'a> {
     pub id: &'a str,
@@ -211,162 +209,4 @@ pub struct ScheduleCreateParams<'a> {
     pub promise_tags: &'a str,
     pub created_at: i64,
     pub next_run_at: i64,
-}
-
-/// The Db trait — CTE-based operations within a transaction
-pub trait Db {
-    /// Returns the configured task retry timeout in milliseconds.
-    /// Used wherever a pending task timeout is inserted or reset.
-    fn task_retry_timeout(&self) -> i64;
-
-    // Ghost operation — runs before every user operation
-    fn try_timeout(&self, ids: &[&str], time: i64) -> StorageResult<()>;
-    fn lock_for_update(&self, id: &str) -> StorageResult<(bool, bool)>;
-    fn process_callbacks(&self, promise_id: &str, time: i64) -> StorageResult<()>;
-
-    // === Promise operations ===
-    fn promise_get(&self, id: &str) -> StorageResult<Option<PromiseRecord>>;
-
-    fn promise_create(&self, params: &PromiseCreateParams) -> StorageResult<PromiseCreateResult>;
-
-    fn promise_settle(&self, params: &PromiseSettleParams) -> StorageResult<PromiseSettleResult>;
-
-    fn promise_register_callback(
-        &self,
-        awaited_id: &str,
-        awaiter_id: &str,
-        time: i64,
-    ) -> StorageResult<RegisterCallbackResult>;
-
-    fn promise_register_listener(
-        &self,
-        awaited_id: &str,
-        address: &str,
-    ) -> StorageResult<Option<PromiseRecord>>;
-
-    fn promise_search(
-        &self,
-        state: Option<&str>,
-        tags: Option<&str>,
-        cursor: Option<&str>,
-        limit: i64,
-    ) -> StorageResult<Vec<PromiseRecord>>;
-
-    // === Task operations ===
-    fn task_get(&self, id: &str) -> StorageResult<Option<TaskRecord>>;
-
-    fn task_create(&self, params: &TaskCreateParams) -> StorageResult<TaskCreateResult>;
-
-    fn task_acquire(&self, params: &TaskAcquireParams) -> StorageResult<TaskAcquireResult>;
-
-    fn task_fence_create(&self, params: &TaskFenceCreateParams) -> StorageResult<TaskFenceResult>;
-
-    fn task_fence_settle(&self, params: &TaskFenceSettleParams) -> StorageResult<TaskFenceResult>;
-
-    fn task_heartbeat(&self, pid: &str, tasks: &[(&str, i64)], time: i64) -> StorageResult<()>;
-
-    fn task_suspend(
-        &self,
-        task_id: &str,
-        version: i64,
-        awaited_ids: &[&str],
-    ) -> StorageResult<TaskSuspendResult>;
-
-    fn task_fulfill(&self, params: &TaskFulfillParams) -> StorageResult<TaskFulfillResult>;
-
-    fn task_release(
-        &self,
-        task_id: &str,
-        version: i64,
-        time: i64,
-        ttl: i64,
-    ) -> StorageResult<TaskReleaseResult>;
-
-    fn task_halt(&self, task_id: &str) -> StorageResult<TaskHaltResult>;
-
-    fn task_continue(&self, task_id: &str, time: i64) -> StorageResult<TaskContinueResult>;
-
-    fn task_search(
-        &self,
-        state: Option<&str>,
-        cursor: Option<&str>,
-        limit: i64,
-    ) -> StorageResult<Vec<TaskRecord>>;
-
-    fn compute_preload(&self, promise_id: &str) -> StorageResult<Vec<PromiseRecord>>;
-
-    // === Schedule operations ===
-    fn schedule_get(&self, id: &str) -> StorageResult<Option<ScheduleRecord>>;
-
-    fn schedule_create(&self, params: &ScheduleCreateParams) -> StorageResult<ScheduleRecord>;
-
-    fn schedule_delete(&self, id: &str) -> StorageResult<bool>;
-
-    fn schedule_search(
-        &self,
-        tags: Option<&str>,
-        cursor: Option<&str>,
-        limit: i64,
-    ) -> StorageResult<Vec<ScheduleRecord>>;
-
-    fn get_expired_schedule_timeouts(&self, time: i64) -> StorageResult<Vec<(String, i64)>>;
-
-    fn process_schedule_timeout(
-        &self,
-        schedule_id: &str,
-        fired_at: i64,
-        next_run_at: i64,
-        time: i64,
-        promise_tags: &HashMap<String, String>,
-    ) -> StorageResult<Option<ScheduleRecord>>;
-
-    // === Timeout processing ===
-    fn process_timeouts(&self, time: i64) -> StorageResult<()>;
-
-    // === Readiness check ===
-    /// Lightweight storage probe: executes `SELECT 1` to verify the backend is responsive.
-    fn ping(&self) -> StorageResult<()>;
-
-    // === Debug operations ===
-    fn debug_reset(&self) -> StorageResult<()>;
-    fn snap(&self) -> StorageResult<Snapshot>;
-
-    // === Outgoing messages (for background delivery) ===
-    /// Atomically claim and delete a batch of outgoing messages using DELETE ... RETURNING.
-    /// Guarantees at-most-once delivery: messages are removed before delivery is attempted.
-    fn take_outgoing(
-        &self,
-        batch_size: i64,
-    ) -> StorageResult<(Vec<OutgoingExecute>, Vec<OutgoingUnblock>)>;
-}
-
-/// Enum-based storage to avoid trait object limitations with generic methods.
-///
-/// The SqliteNetwork only ever uses the `Sqlite` variant; the enum is preserved
-/// so the vendored server handlers can call `storage.transact`/`storage.query`
-/// exactly as in the upstream server.
-pub enum Storage {
-    Sqlite(persistence_sqlite::SqliteStorage),
-}
-
-impl Storage {
-    pub async fn transact<F, T>(&self, f: F) -> StorageResult<T>
-    where
-        F: FnMut(&dyn Db) -> StorageResult<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        match self {
-            Storage::Sqlite(s) => s.transact(f).await,
-        }
-    }
-
-    pub async fn query<F, T>(&self, f: F) -> StorageResult<T>
-    where
-        F: FnMut(&dyn Db) -> StorageResult<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        match self {
-            Storage::Sqlite(s) => s.query(f).await,
-        }
-    }
 }

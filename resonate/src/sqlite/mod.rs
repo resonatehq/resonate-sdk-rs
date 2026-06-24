@@ -22,8 +22,8 @@
 //! use resonate_sdk::prelude::*;
 //! use resonate_sdk::sqlite::SqliteNetwork;
 //!
-//! # fn main() -> resonate_sdk::error::Result<()> {
-//! let net = Arc::new(SqliteNetwork::new("resonate.db", None, None)?);
+//! # async fn example() -> resonate_sdk::error::Result<()> {
+//! let net = Arc::new(SqliteNetwork::new("resonate.db", None, None).await?);
 //! let resonate = Resonate::new(ResonateConfig {
 //!     network: Some(net),
 //!     ..Default::default()
@@ -33,9 +33,9 @@
 //! # }
 //! ```
 //!
-//! Note: like the upstream server, the SQLite backend runs its transactions via
-//! [`tokio::task::block_in_place`], so a `SqliteNetwork` must be driven on a
-//! **multi-threaded** Tokio runtime (`#[tokio::main]` / `flavor = "multi_thread"`).
+//! Note: the libsql backend is natively async (queries run through the libsql
+//! client, not [`tokio::task::block_in_place`]), so a `SqliteNetwork` runs on any
+//! Tokio runtime — single- or multi-threaded.
 
 mod address;
 mod persistence;
@@ -55,13 +55,29 @@ use crate::error::{Error, Result};
 use crate::network::Network;
 
 use address::{parse_address, Address, PollCast};
-use persistence::Storage;
 use persistence_sqlite::SqliteStorage;
 use server::{dispatch, Server};
 pub use server::{Config, MessagesConfig, ServerConfig, TasksConfig, TimeoutsConfig};
 use types::RequestEnvelope;
 
 type Subscribers = RwLock<Vec<Box<dyn Fn(String) + Send + Sync>>>;
+
+/// Selects how the embedded server's libsql database is opened.
+#[derive(Clone, Debug)]
+pub enum SqliteBackend {
+    /// A local database file, or `":memory:"` for an ephemeral in-memory DB.
+    Local(String),
+    /// A remote Turso/sqld database addressed by URL with an auth token.
+    Remote { url: String, auth_token: String },
+    /// An embedded replica: a local file kept in sync with a remote database.
+    RemoteReplica {
+        path: String,
+        url: String,
+        auth_token: String,
+        /// Optional background sync interval. `None` syncs only on open.
+        sync_interval: Option<Duration>,
+    },
+}
 
 /// A single client connection registered with a [`SqliteServer`].
 struct Connection {
@@ -96,21 +112,63 @@ impl Drop for SqliteServer {
 }
 
 impl SqliteServer {
-    /// Open (or create) the SQLite database at `path` (use `":memory:"` for an
-    /// ephemeral DB) with default [`Config`].
-    pub fn open(path: &str) -> Result<Arc<Self>> {
-        Self::open_with_config(path, Config::default())
+    /// Open (or create) a local libsql database at `path` (use `":memory:"` for
+    /// an ephemeral DB) with default [`Config`].
+    pub async fn open(path: &str) -> Result<Arc<Self>> {
+        Self::open_backend(SqliteBackend::Local(path.to_string()), Config::default()).await
     }
 
     /// Like [`SqliteServer::open`], but with an explicit [`Config`].
-    pub fn open_with_config(path: &str, config: Config) -> Result<Arc<Self>> {
-        let storage = SqliteStorage::open(path, config.tasks.retry_timeout).map_err(|e| {
-            Error::ServerError {
+    pub async fn open_with_config(path: &str, config: Config) -> Result<Arc<Self>> {
+        Self::open_backend(SqliteBackend::Local(path.to_string()), config).await
+    }
+
+    /// Open against a remote Turso/sqld database (URL + auth token).
+    pub async fn open_remote(
+        url: impl Into<String>,
+        auth_token: impl Into<String>,
+        config: Config,
+    ) -> Result<Arc<Self>> {
+        Self::open_backend(
+            SqliteBackend::Remote {
+                url: url.into(),
+                auth_token: auth_token.into(),
+            },
+            config,
+        )
+        .await
+    }
+
+    /// Open an embedded replica: a local file at `path` kept in sync with a
+    /// remote database (URL + auth token), optionally syncing on `sync_interval`.
+    pub async fn open_remote_replica(
+        path: impl Into<String>,
+        url: impl Into<String>,
+        auth_token: impl Into<String>,
+        sync_interval: Option<Duration>,
+        config: Config,
+    ) -> Result<Arc<Self>> {
+        Self::open_backend(
+            SqliteBackend::RemoteReplica {
+                path: path.into(),
+                url: url.into(),
+                auth_token: auth_token.into(),
+                sync_interval,
+            },
+            config,
+        )
+        .await
+    }
+
+    /// Open the server against an explicit [`SqliteBackend`] and [`Config`].
+    pub async fn open_backend(backend: SqliteBackend, config: Config) -> Result<Arc<Self>> {
+        let storage = SqliteStorage::open(&backend, config.tasks.retry_timeout)
+            .await
+            .map_err(|e| Error::ServerError {
                 code: 500,
-                message: format!("failed to open sqlite database '{}': {}", path, e),
-            }
-        })?;
-        let server = Arc::new(Server::new(config, Storage::Sqlite(storage)));
+                message: format!("failed to open sqlite database: {}", e),
+            })?;
+        let server = Arc::new(Server::new(config, storage));
         Ok(Arc::new(Self {
             shared: Arc::new(Shared {
                 server,
@@ -126,7 +184,7 @@ impl SqliteServer {
     /// - `pid`: Process ID for this worker (or generated).
     /// - `group`: Group name for routing (default: `"default"`).
     pub fn connect(self: &Arc<Self>, pid: Option<String>, group: Option<String>) -> SqliteNetwork {
-        let pid = pid.unwrap_or_else(uuid_no_dashes);
+        let pid = pid.unwrap_or_else(crate::network::uuid_no_dashes);
         let group = group.unwrap_or_else(|| "default".to_string());
         let unicast = format!("poll://uni@{}/{}", group, pid);
         let anycast = format!("poll://any@{}/{}", group, pid);
@@ -159,18 +217,16 @@ impl SqliteServer {
             let mut interval = tokio::time::interval(Duration::from_millis(timeout_interval));
             loop {
                 interval.tick().await;
-                if timeout_shared
-                    .server
-                    .debug_mode
-                    .load(Ordering::SeqCst)
-                {
+                if timeout_shared.server.debug_mode.load(Ordering::SeqCst) {
                     continue;
                 }
                 let now = util::system_time_ms();
                 if let Err(e) = timeout_shared
                     .server
                     .storage
-                    .transact(move |db| processing::process_all_timeouts(db, now))
+                    .transact(move |db| {
+                        Box::pin(async move { processing::process_all_timeouts(db, now).await })
+                    })
                     .await
                 {
                     tracing::error!(error = %e, "sqlite_network: background timeout processing failed");
@@ -210,18 +266,29 @@ pub struct SqliteNetwork {
 impl SqliteNetwork {
     /// Open a private [`SqliteServer`] at `path` and return a single connection
     /// to it. Use [`SqliteServer::connect`] to share one server across workers.
-    pub fn new(path: &str, pid: Option<String>, group: Option<String>) -> Result<Self> {
-        Self::with_config(path, pid, group, Config::default())
+    pub async fn new(path: &str, pid: Option<String>, group: Option<String>) -> Result<Self> {
+        Self::with_config(path, pid, group, Config::default()).await
     }
 
     /// Like [`SqliteNetwork::new`], but with an explicit [`Config`].
-    pub fn with_config(
+    pub async fn with_config(
         path: &str,
         pid: Option<String>,
         group: Option<String>,
         config: Config,
     ) -> Result<Self> {
-        let server = SqliteServer::open_with_config(path, config)?;
+        let server = SqliteServer::open_with_config(path, config).await?;
+        Ok(server.connect(pid, group))
+    }
+
+    /// Like [`SqliteNetwork::new`], but against an explicit [`SqliteBackend`].
+    pub async fn with_backend(
+        backend: SqliteBackend,
+        pid: Option<String>,
+        group: Option<String>,
+        config: Config,
+    ) -> Result<Self> {
+        let server = SqliteServer::open_backend(backend, config).await?;
         Ok(server.connect(pid, group))
     }
 }
@@ -239,7 +306,7 @@ async fn route_outgoing(shared: &Arc<Shared>) {
     let (execute_msgs, unblock_msgs) = match shared
         .server
         .storage
-        .transact(move |db| db.take_outgoing(batch_size))
+        .transact(move |db| Box::pin(async move { db.take_outgoing(batch_size).await }))
         .await
     {
         Ok(msgs) => msgs,
@@ -359,15 +426,6 @@ impl Network for SqliteNetwork {
     }
 }
 
-fn uuid_no_dashes() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:032x}", now ^ 0xdeadbeef_cafebabe_u128)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,13 +441,15 @@ mod tests {
         resp.get("data").unwrap_or(resp)
     }
 
-    fn net() -> SqliteNetwork {
-        SqliteNetwork::new(":memory:", Some("test-pid".into()), Some("default".into())).unwrap()
+    async fn net() -> SqliteNetwork {
+        SqliteNetwork::new(":memory:", Some("test-pid".into()), Some("default".into()))
+            .await
+            .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn identity() {
-        let net = net();
+        let net = net().await;
         assert_eq!(net.pid(), "test-pid");
         assert_eq!(net.group(), "default");
         assert_eq!(net.unicast(), "poll://uni@default/test-pid");
@@ -399,7 +459,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn creates_and_gets_promise() {
-        let net = net();
+        let net = net().await;
         let create = serde_json::json!({
             "kind": "promise.create",
             "head": { "corrId": "c1", "version": "2026-04-01" },
@@ -427,7 +487,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn idempotent_promise_create() {
-        let net = net();
+        let net = net().await;
         let create = serde_json::json!({
             "kind": "promise.create",
             "head": { "corrId": "c1", "version": "2026-04-01" },
@@ -446,7 +506,7 @@ mod tests {
     async fn task_create_dispatches_execute_to_subscriber() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let net = net();
+        let net = net().await;
         let count = Arc::new(AtomicUsize::new(0));
         let count2 = count.clone();
         net.recv(Box::new(move |raw: String| {

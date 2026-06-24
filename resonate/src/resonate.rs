@@ -1052,6 +1052,138 @@ mod tests {
     use crate::PROTOCOL_VERSION;
     use std::time::Duration;
 
+    // ── Network parametrization ────────────────────────────────────
+    //
+    // Every behavioral test runs against both in-process networks: the
+    // hand-written [`LocalNetwork`] and the vendored-server-backed
+    // [`SqliteNetwork`]. They differ only in the address scheme they stamp
+    // (`local://` vs `poll://`); see [`NetworkKind::scheme`]. The `for_each_network!`
+    // macro emits a `::local` and a `::sqlite` variant for each test.
+
+    #[derive(Clone, Copy, Debug)]
+    enum NetworkKind {
+        Local,
+        Sqlite,
+    }
+
+    impl NetworkKind {
+        /// Address scheme this network stamps into unicast/anycast and the
+        /// `resonate:target` promise tag.
+        fn scheme(self) -> &'static str {
+            match self {
+                NetworkKind::Local => "local",
+                NetworkKind::Sqlite => "poll",
+            }
+        }
+
+        /// Build a `Resonate` on this network, applying the same local-mode
+        /// defaults `Resonate::local_with` uses (pid/group = "default",
+        /// ttl = MAX) so the two networks are behaviourally interchangeable.
+        async fn resonate_with(self, mut config: ResonateConfig) -> Resonate {
+            match self {
+                NetworkKind::Local => Resonate::local_with(config),
+                NetworkKind::Sqlite => {
+                    config.pid.get_or_insert_with(|| "default".to_string());
+                    config.group.get_or_insert_with(|| "default".to_string());
+                    // Unlike LocalNetwork, the SQLite persistence layer computes
+                    // `created_at + ttl` directly, so a MAX ttl overflows. Use the
+                    // standard finite default (matching the `e2e` harness); no
+                    // behavioral test depends on the worker lease ttl.
+                    config.ttl.get_or_insert(60_000);
+                    config.url = None;
+                    let net = crate::sqlite::SqliteNetwork::new(
+                        ":memory:",
+                        config.pid.clone(),
+                        config.group.clone(),
+                    )
+                    .await
+                    .expect("open sqlite network");
+                    config.network = Some(Arc::new(net));
+                    Resonate::new(config)
+                }
+            }
+        }
+    }
+
+    /// Per-test harness wrapping a [`NetworkKind`]. Tracks every `Resonate` it
+    /// builds so the generated test wrapper can `stop()` them all on exit.
+    ///
+    /// Each `for_each_network!` test runs on its own multi-thread runtime. The
+    /// `Resonate` instances they build spawn background loops (heartbeat,
+    /// processing, subscription-refresh) that keep the runtime — and its I/O
+    /// driver file descriptors — alive. Without an explicit `stop()`, tokio's
+    /// non-blocking runtime `Drop` never reclaims those fds, so the ~150 tests
+    /// in this binary accumulate descriptors until `build()` fails with EMFILE
+    /// ("Too many open files") on machines with the default soft `ulimit -n`.
+    #[derive(Clone)]
+    struct TestNet {
+        kind: NetworkKind,
+        created: std::rc::Rc<std::cell::RefCell<Vec<Arc<Resonate>>>>,
+    }
+
+    impl TestNet {
+        fn new(kind: NetworkKind) -> Self {
+            Self {
+                kind,
+                created: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            }
+        }
+
+        /// Address scheme this network stamps into promise tags.
+        fn scheme(&self) -> &'static str {
+            self.kind.scheme()
+        }
+
+        /// Build a `Resonate` with default config, tracked for `stop_all`.
+        async fn resonate(&self) -> Arc<Resonate> {
+            self.resonate_with(ResonateConfig::default()).await
+        }
+
+        /// Build a `Resonate` with custom config, tracked for `stop_all`.
+        async fn resonate_with(&self, config: ResonateConfig) -> Arc<Resonate> {
+            let r = Arc::new(self.kind.resonate_with(config).await);
+            self.created.borrow_mut().push(r.clone());
+            r
+        }
+
+        /// Stop every `Resonate` built during the test, aborting their
+        /// background loops so the runtime can drop and release its fds.
+        async fn stop_all(&self) {
+            let instances: Vec<Arc<Resonate>> = self.created.borrow_mut().drain(..).collect();
+            for r in instances {
+                let _ = r.stop().await;
+            }
+        }
+    }
+
+    /// Define a test that runs against both networks. Generates
+    /// `<name>::local` and `<name>::sqlite`, each on a multi-thread runtime
+    /// (the SQLite background loops need a real reactor). After the body runs,
+    /// every `Resonate` it built is `stop()`ped — see [`TestNet`] for why.
+    macro_rules! for_each_network {
+        ($name:ident, |$net:ident| $body:block) => {
+            mod $name {
+                use super::*;
+
+                async fn body($net: TestNet) $body
+
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn local() {
+                    let net = TestNet::new(NetworkKind::Local);
+                    body(net.clone()).await;
+                    net.stop_all().await;
+                }
+
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn sqlite() {
+                    let net = TestNet::new(NetworkKind::Sqlite);
+                    body(net.clone()).await;
+                    net.stop_all().await;
+                }
+            }
+        };
+    }
+
     // ── Test functions ─────────────────────────────────────────────
 
     #[resonate_sdk_macros::function]
@@ -1164,42 +1296,38 @@ mod tests {
     //  Register Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn register_function_by_name() {
-        let r = Resonate::local();
+    for_each_network!(register_function_by_name, |net| {
+        let r = net.resonate().await;
         r.register(add).unwrap();
 
         // Verify function is registered (spawn won't fail with FunctionNotFound)
         let result = r.run("test-id", add, (1i64, 2i64)).spawn().await;
         assert!(result.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn register_duplicate_function_returns_error() {
-        let r = Resonate::local();
+    for_each_network!(register_duplicate_function_returns_error, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
         let err = r.register(noop);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("already registered"));
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  run Tests (builder API)
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn run_spawn_returns_handle_for_registered_function() {
-        let r = Resonate::local();
+    for_each_network!(run_spawn_returns_handle_for_registered_function, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let handle = r.run("greet-1", noop, ()).spawn().await;
         assert!(handle.is_ok());
         assert_eq!(handle.unwrap().id, "greet-1");
-    }
+    });
 
-    #[tokio::test]
-    async fn run_unregistered_function_returns_function_not_found() {
-        let r = Resonate::local();
+    for_each_network!(run_unregistered_function_returns_function_not_found, |net| {
+        let r = net.resonate().await;
         // Use a registered wrapper to test — noop is not registered here
         let result: Result<()> = r.run("test-id", noop, ()).await;
         assert!(result.is_err());
@@ -1207,24 +1335,23 @@ mod tests {
             Error::FunctionNotFound(name) => assert_eq!(name, "noop"),
             other => panic!("expected FunctionNotFound, got {:?}", other),
         }
-    }
+    });
 
-    #[tokio::test]
-    async fn run_spawn_with_prefix_prepends_to_id() {
-        let r = Resonate::local_with(ResonateConfig {
+    for_each_network!(run_spawn_with_prefix_prepends_to_id, |net| {
+        let r = net.resonate_with(ResonateConfig {
             prefix: Some("app".into()),
             pid: Some("default".into()),
             ..Default::default()
-        });
+        })
+        .await;
         r.register(noop).unwrap();
 
         let handle = r.run("my-id", noop, ()).spawn().await.unwrap();
         assert_eq!(handle.id, "app:my-id");
-    }
+    });
 
-    #[tokio::test]
-    async fn run_spawn_creates_task_and_promise() {
-        let r = Resonate::local();
+    for_each_network!(run_spawn_creates_task_and_promise, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let _handle = r.run("task-1", noop, ()).spawn().await.unwrap();
@@ -1235,11 +1362,10 @@ mod tests {
             get_handle.is_ok(),
             "promise should exist after run().spawn()"
         );
-    }
+    });
 
-    #[tokio::test]
-    async fn run_spawn_idempotent_same_id_returns_existing_promise() {
-        let r = Resonate::local();
+    for_each_network!(run_spawn_idempotent_same_id_returns_existing_promise, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let h1 = r.run("same-id", noop, ()).spawn().await;
@@ -1249,11 +1375,10 @@ mod tests {
         let h2 = r.run("same-id", noop, ()).spawn().await;
         assert!(h2.is_ok());
         assert_eq!(h2.unwrap().id, "same-id");
-    }
+    });
 
-    #[tokio::test]
-    async fn run_spawn_sets_correct_tags() {
-        let r = Resonate::local();
+    for_each_network!(run_spawn_sets_correct_tags, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let mut m = std::collections::HashMap::new();
@@ -1261,11 +1386,10 @@ mod tests {
 
         let handle = r.run("tag-test", noop, ()).tags(m).spawn().await;
         assert!(handle.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn run_spawn_with_custom_timeout() {
-        let r = Resonate::local();
+    for_each_network!(run_spawn_with_custom_timeout, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let handle = r
@@ -1274,15 +1398,14 @@ mod tests {
             .spawn()
             .await;
         assert!(handle.is_ok());
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  rpc Tests (builder API)
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn rpc_spawn_creates_promise_not_task() {
-        let r = Resonate::local();
+    for_each_network!(rpc_spawn_creates_promise_not_task, |net| {
+        let r = net.resonate().await;
         // RPC does NOT require function to be registered locally
         let handle = r
             .rpc::<_, ()>("rpc-1", "remote_func", (1i32,))
@@ -1290,30 +1413,28 @@ mod tests {
             .await;
         assert!(handle.is_ok());
         assert_eq!(handle.unwrap().id, "rpc-1");
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_spawn_with_prefix() {
-        let r = Resonate::local_with(ResonateConfig {
+    for_each_network!(rpc_spawn_with_prefix, |net| {
+        let r = net.resonate_with(ResonateConfig {
             prefix: Some("svc".into()),
             ..Default::default()
-        });
+        })
+        .await;
 
         let handle = r.rpc::<_, ()>("rpc-2", "remote", ()).spawn().await.unwrap();
         assert_eq!(handle.id, "svc:rpc-2");
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_spawn_sets_scope_global() {
-        let r = Resonate::local();
+    for_each_network!(rpc_spawn_sets_scope_global, |net| {
+        let r = net.resonate().await;
         // Verifying RPC succeeds — tags (scope=global, target) are set internally
         let handle = r.rpc::<_, ()>("rpc-scope", "remote", ()).spawn().await;
         assert!(handle.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_spawn_with_custom_target() {
-        let r = Resonate::local();
+    for_each_network!(rpc_spawn_with_custom_target, |net| {
+        let r = net.resonate().await;
 
         let handle = r
             .rpc::<_, ()>("rpc-target", "remote", ())
@@ -1321,11 +1442,10 @@ mod tests {
             .spawn()
             .await;
         assert!(handle.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_spawn_idempotent_same_id() {
-        let r = Resonate::local();
+    for_each_network!(rpc_spawn_idempotent_same_id, |net| {
+        let r = net.resonate().await;
 
         let h1 = r.rpc::<_, ()>("rpc-dup", "remote", ()).spawn().await;
         assert!(h1.is_ok());
@@ -1333,26 +1453,24 @@ mod tests {
         // Same ID should return existing promise
         let h2 = r.rpc::<_, ()>("rpc-dup", "remote", ()).spawn().await;
         assert!(h2.is_ok());
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  get Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn get_nonexistent_promise_returns_error() {
-        let r = Resonate::local();
+    for_each_network!(get_nonexistent_promise_returns_error, |net| {
+        let r = net.resonate().await;
         let result = r.get::<()>("nonexistent").await;
         assert!(result.is_err());
         match result.unwrap_err() {
             Error::ServerError { code, .. } => assert_eq!(code, 404),
             other => panic!("expected ServerError 404, got {:?}", other),
         }
-    }
+    });
 
-    #[tokio::test]
-    async fn get_existing_promise_returns_handle() {
-        let r = Resonate::local();
+    for_each_network!(get_existing_promise_returns_handle, |net| {
+        let r = net.resonate().await;
 
         // Create a promise via RPC first
         r.rpc::<_, ()>("get-test", "func", ())
@@ -1364,14 +1482,14 @@ mod tests {
         let handle = r.get::<()>("get-test").await;
         assert!(handle.is_ok());
         assert_eq!(handle.unwrap().id, "get-test");
-    }
+    });
 
-    #[tokio::test]
-    async fn get_with_prefix_prepends_prefix() {
-        let r = Resonate::local_with(ResonateConfig {
+    for_each_network!(get_with_prefix_prepends_prefix, |net| {
+        let r = net.resonate_with(ResonateConfig {
             prefix: Some("ns".into()),
             ..Default::default()
-        });
+        })
+        .await;
 
         // Create via RPC (which prepends prefix)
         r.rpc::<_, ()>("p1", "func", ()).spawn().await.unwrap();
@@ -1380,24 +1498,22 @@ mod tests {
         let handle = r.get::<()>("p1").await;
         assert!(handle.is_ok());
         assert_eq!(handle.unwrap().id, "ns:p1");
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  schedule Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn schedule_creates_schedule() {
-        let r = Resonate::local();
+    for_each_network!(schedule_creates_schedule, |net| {
+        let r = net.resonate().await;
         let result = r
             .schedule("my-schedule", "*/5 * * * *", "my-func", ())
             .await;
         assert!(result.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn schedule_returns_deletable_handle() {
-        let r = Resonate::local();
+    for_each_network!(schedule_returns_deletable_handle, |net| {
+        let r = net.resonate().await;
         let schedule = r
             .schedule("deletable", "0 * * * *", "func", ())
             .await
@@ -1405,24 +1521,22 @@ mod tests {
         // Deleting should not fail
         let result = schedule.delete().await;
         assert!(result.is_ok());
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Builder Options Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn run_builder_uses_defaults() {
-        let r = Resonate::local();
+    for_each_network!(run_builder_uses_defaults, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
         // Default options should work — just spawn and check
         let handle = r.run("defaults-test", noop, ()).spawn().await;
         assert!(handle.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn run_builder_with_timeout_and_version() {
-        let r = Resonate::local();
+    for_each_network!(run_builder_with_timeout_and_version, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let handle = r
@@ -1432,11 +1546,10 @@ mod tests {
             .spawn()
             .await;
         assert!(handle.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn run_builder_with_tags() {
-        let r = Resonate::local();
+    for_each_network!(run_builder_with_tags, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let mut m = std::collections::HashMap::new();
@@ -1444,11 +1557,10 @@ mod tests {
 
         let handle = r.run("builder-tags", noop, ()).tags(m).spawn().await;
         assert!(handle.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_builder_target_resolution_bare_name() {
-        let r = Resonate::local();
+    for_each_network!(rpc_builder_target_resolution_bare_name, |net| {
+        let r = net.resonate().await;
 
         let handle = r
             .rpc::<_, ()>("target-bare", "func", ())
@@ -1465,13 +1577,12 @@ mod tests {
         let target = resp["data"]["promise"]["tags"]["resonate:target"]
             .as_str()
             .unwrap_or("");
-        assert_eq!(target, "local://any@my-worker");
+        assert_eq!(target, format!("{}://any@my-worker", net.scheme()));
         drop(handle);
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_builder_target_resolution_url_passthrough() {
-        let r = Resonate::local();
+    for_each_network!(rpc_builder_target_resolution_url_passthrough, |net| {
+        let r = net.resonate().await;
 
         let handle = r
             .rpc::<_, ()>("target-url", "func", ())
@@ -1490,11 +1601,10 @@ mod tests {
             .unwrap_or("");
         assert_eq!(target, "https://remote:9000/workers/hello");
         drop(handle);
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_builder_default_target() {
-        let r = Resonate::local();
+    for_each_network!(rpc_builder_default_target, |net| {
+        let r = net.resonate().await;
 
         let _handle = r
             .rpc::<_, ()>("target-default", "func", ())
@@ -1511,32 +1621,29 @@ mod tests {
             .as_str()
             .unwrap_or("");
         // "default" gets resolved through network.match → "local://any@default"
-        assert_eq!(target, "local://any@default");
-    }
+        assert_eq!(target, format!("{}://any@default", net.scheme()));
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  stop Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn stop_is_clean() {
-        let r = Resonate::local();
+    for_each_network!(stop_is_clean, |net| {
+        let r = net.resonate().await;
         let result = r.stop().await;
         assert!(result.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn stop_can_be_called_twice() {
-        let r = Resonate::local();
+    for_each_network!(stop_can_be_called_twice, |net| {
+        let r = net.resonate().await;
         r.stop().await.unwrap();
         // Second stop should also be fine (idempotent)
         let result = r.stop().await;
         assert!(result.is_ok());
-    }
+    });
 
-    #[tokio::test]
-    async fn stop_aborts_subscription_refresh_handle() {
-        let r = Resonate::local();
+    for_each_network!(stop_aborts_subscription_refresh_handle, |net| {
+        let r = net.resonate().await;
         // The refresh handle should be stored (not None)
         {
             let guard = r.subscription_refresh_handle.lock().await;
@@ -1551,11 +1658,10 @@ mod tests {
             let guard = r.subscription_refresh_handle.lock().await;
             assert!(guard.is_none(), "refresh handle should be None after stop");
         }
-    }
+    });
 
-    #[tokio::test]
-    async fn stop_aborts_refresh_task() {
-        let r = Resonate::local();
+    for_each_network!(stop_aborts_refresh_task, |net| {
+        let r = net.resonate().await;
         // Confirm the refresh task is running before stop
         {
             let guard = r.subscription_refresh_handle.lock().await;
@@ -1569,39 +1675,38 @@ mod tests {
         // After stop, handle is taken so we can't inspect it directly,
         // but we verified it was present and stop didn't panic.
         // The idempotent stop test further confirms correctness.
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  ID Prefix Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn no_prefix_leaves_id_unchanged() {
-        let r = Resonate::local();
+    for_each_network!(no_prefix_leaves_id_unchanged, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let handle = r.run("my-id", noop, ()).spawn().await.unwrap();
         assert_eq!(handle.id, "my-id");
-    }
+    });
 
-    #[tokio::test]
-    async fn prefix_is_prepended_with_colon() {
-        let r = Resonate::local_with(ResonateConfig {
+    for_each_network!(prefix_is_prepended_with_colon, |net| {
+        let r = net.resonate_with(ResonateConfig {
             prefix: Some("prefix".into()),
             ..Default::default()
-        });
+        })
+        .await;
         r.register(noop).unwrap();
 
         let handle = r.run("my-id", noop, ()).spawn().await.unwrap();
         assert_eq!(handle.id, "prefix:my-id");
-    }
+    });
 
-    #[tokio::test]
-    async fn prefix_applied_consistently_to_run_rpc_and_get() {
-        let r = Resonate::local_with(ResonateConfig {
+    for_each_network!(prefix_applied_consistently_to_run_rpc_and_get, |net| {
+        let r = net.resonate_with(ResonateConfig {
             prefix: Some("p".into()),
             ..Default::default()
-        });
+        })
+        .await;
         r.register(noop).unwrap();
 
         // run().spawn() with prefix
@@ -1615,62 +1720,57 @@ mod tests {
         // get with prefix (the promise was created as "p:id2")
         let h3 = r.get::<()>("id2").await.unwrap();
         assert_eq!(h3.id, "p:id2");
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Key Difference: run vs rpc
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn run_requires_registered_function() {
-        let r = Resonate::local();
+    for_each_network!(run_requires_registered_function, |net| {
+        let r = net.resonate().await;
         // run fails because noop is not registered
         let result: Result<()> = r.run("run-test", noop, ()).await;
         assert!(matches!(result.unwrap_err(), Error::FunctionNotFound(_)));
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_does_not_require_registered_function() {
-        let r = Resonate::local();
+    for_each_network!(rpc_does_not_require_registered_function, |net| {
+        let r = net.resonate().await;
         // rpc should succeed even without registration (remote worker will handle it)
         let result = r
             .rpc::<_, ()>("rpc-test", "any_remote_func", ())
             .spawn()
             .await;
         assert!(result.is_ok());
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Handle Tests (via Resonate API)
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn handle_id_matches_requested_id() {
-        let r = Resonate::local();
+    for_each_network!(handle_id_matches_requested_id, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let handle = r.run("handle-test", noop, ()).spawn().await.unwrap();
         assert_eq!(handle.id, "handle-test");
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_handle_id_matches() {
-        let r = Resonate::local();
+    for_each_network!(rpc_handle_id_matches, |net| {
+        let r = net.resonate().await;
         let handle = r
             .rpc::<_, ()>("rpc-handle", "remote", ())
             .spawn()
             .await
             .unwrap();
         assert_eq!(handle.id, "rpc-handle");
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Multiple Operations Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn multiple_run_spawns_with_different_ids() {
-        let r = Resonate::local();
+    for_each_network!(multiple_run_spawns_with_different_ids, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let h1 = r.run("m1", noop, ()).spawn().await;
@@ -1683,11 +1783,10 @@ mod tests {
         assert_eq!(h1.unwrap().id, "m1");
         assert_eq!(h2.unwrap().id, "m2");
         assert_eq!(h3.unwrap().id, "m3");
-    }
+    });
 
-    #[tokio::test]
-    async fn mixed_run_and_rpc_operations() {
-        let r = Resonate::local();
+    for_each_network!(mixed_run_and_rpc_operations, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let local_h = r.run("local-1", noop, ()).spawn().await;
@@ -1695,15 +1794,14 @@ mod tests {
 
         assert!(local_h.is_ok());
         assert!(remote_h.is_ok());
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Sub-client Access Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn promises_sub_client_create_and_get() {
-        let r = Resonate::local();
+    for_each_network!(promises_sub_client_create_and_get, |net| {
+        let r = net.resonate().await;
 
         // Create a promise via the sub-client
         let created = r
@@ -1722,11 +1820,10 @@ mod tests {
         let fetched = r.promises.get("sub-p1").await;
         assert!(fetched.is_ok());
         assert_eq!(fetched.unwrap().id, "sub-p1");
-    }
+    });
 
-    #[tokio::test]
-    async fn promises_sub_client_settle() {
-        let r = Resonate::local();
+    for_each_network!(promises_sub_client_settle, |net| {
+        let r = net.resonate().await;
 
         // Create then settle
         r.promises
@@ -1752,20 +1849,19 @@ mod tests {
         // Verify it's settled
         let fetched = r.promises.get("sub-p2").await.unwrap();
         assert_eq!(fetched.state, PromiseState::Resolved);
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Transport / Network Passthrough Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn transport_accessible_from_resonate() {
-        let r = Resonate::local();
+    for_each_network!(transport_accessible_from_resonate, |net| {
+        let r = net.resonate().await;
         // Verify we can send a raw request through the transport
         let req = promise_create_req("transport-test", i64::MAX);
         let resp = r.transport().send_json(req).await;
         assert!(resp.is_ok());
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  is_url / target_resolver URL bypass Tests
@@ -1783,9 +1879,8 @@ mod tests {
         assert!(!is_url(""));
     }
 
-    #[tokio::test]
-    async fn rpc_with_url_target_passes_through_unchanged() {
-        let r = Resonate::local();
+    for_each_network!(rpc_with_url_target_passes_through_unchanged, |net| {
+        let r = net.resonate().await;
 
         // Use a URL as the target option — should NOT be rewritten by network.match
         let handle = r
@@ -1806,11 +1901,10 @@ mod tests {
             .unwrap_or("");
 
         assert_eq!(target, "https://remote-host:9000/workers/noop");
-    }
+    });
 
-    #[tokio::test]
-    async fn run_with_custom_target() {
-        let r = Resonate::local();
+    for_each_network!(run_with_custom_target, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let _handle = r
@@ -1830,12 +1924,11 @@ mod tests {
             .unwrap_or("");
 
         // Bare name resolved via network.match
-        assert_eq!(target, "local://any@my-target");
-    }
+        assert_eq!(target, format!("{}://any@my-target", net.scheme()));
+    });
 
-    #[tokio::test]
-    async fn run_default_target_uses_network_match() {
-        let r = Resonate::local();
+    for_each_network!(run_default_target_uses_network_match, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let _handle = r.run("run-default-target", noop, ()).spawn().await.unwrap();
@@ -1849,12 +1942,11 @@ mod tests {
             .as_str()
             .unwrap_or("");
 
-        assert_eq!(target, "local://any@default");
-    }
+        assert_eq!(target, format!("{}://any@default", net.scheme()));
+    });
 
-    #[tokio::test]
-    async fn run_url_target_passes_through() {
-        let r = Resonate::local();
+    for_each_network!(run_url_target_passes_through, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         let _handle = r
@@ -1874,11 +1966,10 @@ mod tests {
             .unwrap_or("");
 
         assert_eq!(target, "https://remote:9000/workers/noop");
-    }
+    });
 
-    #[tokio::test]
-    async fn rpc_with_no_target_uses_default() {
-        let r = Resonate::local();
+    for_each_network!(rpc_with_no_target_uses_default, |net| {
+        let r = net.resonate().await;
 
         let handle = r.rpc::<_, ()>("bare-target-test", "noop", ()).spawn().await;
         assert!(handle.is_ok());
@@ -1893,12 +1984,11 @@ mod tests {
             .unwrap_or("");
 
         // Default target "default" is resolved by network.match → "local://any@default"
-        assert_eq!(target, "local://any@default");
-    }
+        assert_eq!(target, format!("{}://any@default", net.scheme()));
+    });
 
-    #[tokio::test]
-    async fn rpc_with_bare_name_target_gets_rewritten() {
-        let r = Resonate::local();
+    for_each_network!(rpc_with_bare_name_target_gets_rewritten, |net| {
+        let r = net.resonate().await;
 
         let handle = r
             .rpc::<_, ()>("bare-target-test2", "noop", ())
@@ -1917,16 +2007,15 @@ mod tests {
             .unwrap_or("");
 
         // Bare name should be resolved by network.match → "local://any@noop"
-        assert_eq!(target, "local://any@noop");
-    }
+        assert_eq!(target, format!("{}://any@noop", net.scheme()));
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Subscription Refactor Tests (watch channels)
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn multiple_handles_same_id_all_resolve() {
-        let r = Resonate::local();
+    for_each_network!(multiple_handles_same_id_all_resolve, |net| {
+        let r = net.resonate().await;
 
         // Create a promise via RPC
         let h1 = r
@@ -1955,11 +2044,10 @@ mod tests {
         let r2 = h2.result().await;
         assert!(r1.is_ok(), "first handle should resolve");
         assert!(r2.is_ok(), "second handle should resolve");
-    }
+    });
 
-    #[tokio::test]
-    async fn early_unblock_before_create_handle() {
-        let r = Resonate::local();
+    for_each_network!(early_unblock_before_create_handle, |net| {
+        let r = net.resonate().await;
 
         // Simulate an early Unblock by inserting a pre-loaded watch entry
         // Use null value to avoid codec encoding issues
@@ -1991,11 +2079,10 @@ mod tests {
         );
         let result = handle.result().await;
         assert!(result.is_ok(), "early unblock handle should resolve");
-    }
+    });
 
-    #[tokio::test]
-    async fn done_returns_false_then_true() {
-        let r = Resonate::local();
+    for_each_network!(done_returns_false_then_true, |net| {
+        let r = net.resonate().await;
 
         // Create a pending promise via RPC
         let handle = r
@@ -2023,11 +2110,10 @@ mod tests {
 
         // Should be done now
         assert!(handle.done().await.unwrap(), "handle should be done now");
-    }
+    });
 
-    #[tokio::test]
-    async fn handle_dropped_without_awaiting_does_not_leak() {
-        let r = Resonate::local();
+    for_each_network!(handle_dropped_without_awaiting_does_not_leak, |net| {
+        let r = net.resonate().await;
 
         // Create handles and drop them without awaiting
         {
@@ -2041,15 +2127,14 @@ mod tests {
         let subs = r.subscriptions.lock().await;
         assert!(subs.contains_key("drop-1"));
         assert!(subs.contains_key("drop-2"));
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  End-to-end Subscription Tests
     // ═══════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn e2e_settle_unblocks_handle() {
-        let r = Resonate::local();
+    for_each_network!(e2e_settle_unblocks_handle, |net| {
+        let r = net.resonate().await;
 
         // Create a pending promise via RPC
         let handle = r.rpc::<_, ()>("e2e-1", "func", ()).spawn().await.unwrap();
@@ -2069,11 +2154,10 @@ mod tests {
         assert!(handle.done().await.unwrap(), "should be done after settle");
         let result = handle.result().await;
         assert!(result.is_ok(), "should resolve successfully");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_multiple_handles_resolve_on_settle() {
-        let r = Resonate::local();
+    for_each_network!(e2e_multiple_handles_resolve_on_settle, |net| {
+        let r = net.resonate().await;
 
         // Create two handles for the same promise
         let h1 = r
@@ -2095,11 +2179,10 @@ mod tests {
         let r2 = h2.result().await;
         assert!(r1.is_ok(), "first handle should resolve");
         assert!(r2.is_ok(), "second handle should resolve");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_reject_unblocks_handle_with_error() {
-        let r = Resonate::local();
+    for_each_network!(e2e_reject_unblocks_handle_with_error, |net| {
+        let r = net.resonate().await;
 
         let handle = r
             .rpc::<_, ()>("e2e-reject", "func", ())
@@ -2117,11 +2200,10 @@ mod tests {
 
         let result = handle.result().await;
         assert!(result.is_err(), "rejected promise should return error");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_settle_before_handle_returns_immediately() {
-        let r = Resonate::local();
+    for_each_network!(e2e_settle_before_handle_returns_immediately, |net| {
+        let r = net.resonate().await;
 
         // Create and immediately settle a promise
         r.promises
@@ -2143,11 +2225,10 @@ mod tests {
         assert!(handle.done().await.unwrap(), "should be done immediately");
         let result = handle.result().await;
         assert!(result.is_ok(), "already-settled promise should resolve");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_result_blocks_until_settle() {
-        let r = Resonate::local();
+    for_each_network!(e2e_result_blocks_until_settle, |net| {
+        let r = net.resonate().await;
 
         let handle = r
             .rpc::<_, ()>("e2e-block", "func", ())
@@ -2168,7 +2249,7 @@ mod tests {
         // result() should block until the settle arrives
         let result = handle.result().await;
         assert!(result.is_ok(), "result() should unblock after settle");
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  End-to-end Function Execution Tests
@@ -2192,29 +2273,26 @@ mod tests {
         Ok(x * y)
     }
 
-    #[tokio::test]
-    async fn e2e_run_simple_function_returns_result() {
-        let r = Resonate::local();
+    for_each_network!(e2e_run_simple_function_returns_result, |net| {
+        let r = net.resonate().await;
         r.register(add).unwrap();
 
         let result: i64 = r.run("e2e-add", add, (3_i64, 4_i64)).await.unwrap();
         assert_eq!(result, 7);
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_run_noop_function_completes() {
-        let r = Resonate::local();
+    for_each_network!(e2e_run_noop_function_completes, |net| {
+        let r = net.resonate().await;
         r.register(noop).unwrap();
 
         // noop returns Ok(()) — use spawn + done to verify it completed
         let handle = r.run("e2e-noop", noop, ()).spawn().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(handle.done().await.unwrap(), "noop should complete");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_run_string_args_and_return() {
-        let r = Resonate::local();
+    for_each_network!(e2e_run_string_args_and_return, |net| {
+        let r = net.resonate().await;
         r.register(greet).unwrap();
 
         let result: String = r
@@ -2222,22 +2300,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "hello, world!");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_run_failing_function_returns_error() {
-        let r = Resonate::local();
+    for_each_network!(e2e_run_failing_function_returns_error, |net| {
+        let r = net.resonate().await;
         r.register(fail_with_message).unwrap();
 
         let result: Result<String> = r
             .run("e2e-fail", fail_with_message, "something broke".to_string())
             .await;
         assert!(result.is_err());
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_run_via_handle_returns_result() {
-        let r = Resonate::local();
+    for_each_network!(e2e_run_via_handle_returns_result, |net| {
+        let r = net.resonate().await;
         r.register(multiply).unwrap();
 
         let handle = r
@@ -2252,11 +2328,10 @@ mod tests {
         assert!(handle.done().await.unwrap(), "should be done");
         let result: i64 = handle.result().await.unwrap();
         assert_eq!(result, 42);
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_run_idempotent_same_id_returns_same_result() {
-        let r = Resonate::local();
+    for_each_network!(e2e_run_idempotent_same_id_returns_same_result, |net| {
+        let r = net.resonate().await;
         r.register(add).unwrap();
 
         let r1: i64 = r.run("e2e-idem", add, (10_i64, 20_i64)).await.unwrap();
@@ -2265,11 +2340,10 @@ mod tests {
         // Second call with same ID should return the same result (idempotent)
         let r2: i64 = r.run("e2e-idem", add, (10_i64, 20_i64)).await.unwrap();
         assert_eq!(r2, 30);
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_run_multiple_functions_concurrently() {
-        let r = Resonate::local();
+    for_each_network!(e2e_run_multiple_functions_concurrently, |net| {
+        let r = net.resonate().await;
         r.register(add).unwrap();
         r.register(multiply).unwrap();
 
@@ -2280,7 +2354,7 @@ mod tests {
 
         assert_eq!(r1.unwrap(), 3_i64);
         assert_eq!(r2.unwrap(), 12_i64);
-    }
+    });
 
     #[resonate_sdk_macros::function]
     async fn spawn_child(ctx: &Context) -> Result<i64> {
@@ -2289,19 +2363,17 @@ mod tests {
         Ok(result)
     }
 
-    #[tokio::test]
-    async fn e2e_workflow_spawn_durable_future_is_send() {
-        let r = Resonate::local();
+    for_each_network!(e2e_workflow_spawn_durable_future_is_send, |net| {
+        let r = net.resonate().await;
         r.register(multiply).unwrap();
         r.register(spawn_child).unwrap();
 
         let result: i64 = r.run("e2e-spawn-child", spawn_child, ()).await.unwrap();
         assert_eq!(result, 15);
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_get_handle_after_run_completes() {
-        let r = Resonate::local();
+    for_each_network!(e2e_get_handle_after_run_completes, |net| {
+        let r = net.resonate().await;
         r.register(add).unwrap();
 
         // Run to completion
@@ -2312,7 +2384,7 @@ mod tests {
         assert!(handle.done().await.unwrap(), "should already be done");
         let result = handle.result().await.unwrap();
         assert_eq!(result, 10);
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Dependency Injection Tests
@@ -2353,40 +2425,39 @@ mod tests {
         Ok("unreachable".to_string())
     }
 
-    #[tokio::test]
-    async fn e2e_workflow_reads_dependency_via_context() {
-        let r = Resonate::local().with_dependency(TestConfig {
+    for_each_network!(e2e_workflow_reads_dependency_via_context, |net| {
+        let r = net.resonate().await;
+        r.deps.insert(TestConfig {
             value: "hello-from-di".to_string(),
         });
         r.register(read_config).unwrap();
 
         let result: String = r.run("di-ctx", read_config, ()).await.unwrap();
         assert_eq!(result, "hello-from-di");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_leaf_reads_dependency_via_info() {
-        let r = Resonate::local().with_dependency(TestConfig {
+    for_each_network!(e2e_leaf_reads_dependency_via_info, |net| {
+        let r = net.resonate().await;
+        r.deps.insert(TestConfig {
             value: "leaf-di".to_string(),
         });
         r.register(read_config_leaf).unwrap();
 
         let result: String = r.run("di-info", read_config_leaf, ()).await.unwrap();
         assert_eq!(result, "leaf-di");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_multiple_dependencies() {
-        let r = Resonate::local()
-            .with_dependency(TestConfig {
-                value: "multi".to_string(),
-            })
-            .with_dependency(TestCounter { count: 42 });
+    for_each_network!(e2e_multiple_dependencies, |net| {
+        let r = net.resonate().await;
+        r.deps.insert(TestConfig {
+            value: "multi".to_string(),
+        });
+        r.deps.insert(TestCounter { count: 42 });
         r.register(read_two_deps).unwrap();
 
         let result: String = r.run("di-multi", read_two_deps, ()).await.unwrap();
         assert_eq!(result, "multi:42");
-    }
+    });
 
     // ═══════════════════════════════════════════════════════════════
     //  Detached (fire-and-forget) Tests
@@ -2421,9 +2492,8 @@ mod tests {
         Ok(id)
     }
 
-    #[tokio::test]
-    async fn e2e_detached_returns_bounded_id_under_origin() {
-        let r = Resonate::local();
+    for_each_network!(e2e_detached_returns_bounded_id_under_origin, |net| {
+        let r = net.resonate().await;
         r.register(detacher_one).unwrap();
 
         let id: String = r.run("e2e-det", detacher_one, ()).await.unwrap();
@@ -2443,11 +2513,10 @@ mod tests {
             "suffix not hex: {}",
             suffix
         );
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_detached_promise_is_created_on_server() {
-        let r = Resonate::local();
+    for_each_network!(e2e_detached_promise_is_created_on_server, |net| {
+        let r = net.resonate().await;
         r.register(detacher_one).unwrap();
 
         let id: String = r.run("e2e-det-exists", detacher_one, ()).await.unwrap();
@@ -2459,11 +2528,10 @@ mod tests {
             "detached promise should exist: {:?}",
             handle.err()
         );
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_detached_does_not_block_parent_completion() {
-        let r = Resonate::local();
+    for_each_network!(e2e_detached_does_not_block_parent_completion, |net| {
+        let r = net.resonate().await;
         r.register(detacher_one).unwrap();
 
         // The detached promise targets a remote function nothing will resolve.
@@ -2477,22 +2545,20 @@ mod tests {
         .expect("workflow should complete without waiting on detached promise")
         .unwrap();
         assert!(id.starts_with("e2e-det-nb."));
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_detached_is_idempotent_on_replay() {
-        let r = Resonate::local();
+    for_each_network!(e2e_detached_is_idempotent_on_replay, |net| {
+        let r = net.resonate().await;
         r.register(detacher_one).unwrap();
 
         let id1: String = r.run("e2e-det-idem", detacher_one, ()).await.unwrap();
         // Re-run same root id — replay must produce the same detached id.
         let id2: String = r.run("e2e-det-idem", detacher_one, ()).await.unwrap();
         assert_eq!(id1, id2);
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_detached_multiple_calls_yield_distinct_ids() {
-        let r = Resonate::local();
+    for_each_network!(e2e_detached_multiple_calls_yield_distinct_ids, |net| {
+        let r = net.resonate().await;
         r.register(detacher_many).unwrap();
 
         let ids: Vec<String> = r.run("e2e-det-many", detacher_many, ()).await.unwrap();
@@ -2504,11 +2570,10 @@ mod tests {
         for id in &ids {
             assert!(id.starts_with("e2e-det-many."));
         }
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_detached_sets_global_scope_and_target_tags() {
-        let r = Resonate::local();
+    for_each_network!(e2e_detached_sets_global_scope_and_target_tags, |net| {
+        let r = net.resonate().await;
         r.register(detacher_with_target).unwrap();
 
         let id: String = r
@@ -2521,20 +2586,19 @@ mod tests {
         assert_eq!(tags["resonate:scope"].as_str().unwrap(), "global");
         assert_eq!(
             tags["resonate:target"].as_str().unwrap(),
-            "local://any@custom-worker"
+            format!("{}://any@custom-worker", net.scheme())
         );
         // Lineage is preserved: parent/origin point back to the workflow.
         assert_eq!(tags["resonate:origin"].as_str().unwrap(), "e2e-det-target");
         assert_eq!(tags["resonate:parent"].as_str().unwrap(), "e2e-det-target");
-    }
+    });
 
-    #[tokio::test]
-    async fn e2e_missing_dependency_panics_gracefully() {
+    for_each_network!(e2e_missing_dependency_panics_gracefully, |net| {
         // Verify that a missing dependency causes a panic that is caught at
         // the task boundary (catch_unwind) — the process doesn't crash.
         // The task gets *released* (not fulfilled), so we can't await the result.
         // Instead, use a timeout to confirm the handle never resolves.
-        let r = Resonate::local();
+        let r = net.resonate().await;
         r.register(read_missing_dep).unwrap();
 
         let handle = r
@@ -2550,5 +2614,5 @@ mod tests {
             timed_out.is_err(),
             "handle should not resolve — task was released after panic"
         );
-    }
+    });
 }

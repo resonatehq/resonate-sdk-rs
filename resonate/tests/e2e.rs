@@ -13,8 +13,7 @@
 //! RESONATE_URL=http://localhost:8001 cargo test --test e2e
 //! ```
 //!
-//! Because the SQLite backend uses `tokio::task::block_in_place`, every test
-//! runs on a multi-threaded runtime. The runtime is capped at `worker_threads = 2`:
+//! Every test runs on a multi-threaded runtime capped at `worker_threads = 2`:
 //! these tests run in parallel, and an unbounded (per-CPU) runtime per test
 //! oversubscribes the machine badly enough to starve reqwest's IO and blow the
 //! 30s timeout when running against a real server.
@@ -74,7 +73,9 @@ async fn backend() -> Backend {
             let gate = server_gate().acquire().await.expect("gate not closed");
             Backend::Url { url, _gate: gate }
         }
-        Err(_) => Backend::Sqlite(SqliteServer::open(":memory:").expect("open sqlite server")),
+        Err(_) => {
+            Backend::Sqlite(SqliteServer::open(":memory:").await.expect("open sqlite server"))
+        }
     }
 }
 
