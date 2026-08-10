@@ -912,8 +912,8 @@ mod tests {
         let mut registry = Registry::new();
         registry.register(use_preload).unwrap();
 
-        // Child promise "p1.0" is preloaded as resolved — rpc won't suspend
-        let preloaded = vec![resolved_promise("p1.0", serde_json::json!(99))];
+        // Child promise "p1:0" is preloaded as resolved — rpc won't suspend
+        let preloaded = vec![resolved_promise("p1:0", serde_json::json!(99))];
 
         let core = test_core(
             harness.build_sender(),
@@ -1342,7 +1342,7 @@ mod tests {
         assert!(
             !requests.iter().any(|r| {
                 r["kind"] == "promise.create"
-                    && r["id"].as_str().is_some_and(|id| id.starts_with("p1."))
+                    && r["id"].as_str().is_some_and(|id| id.starts_with("p1:"))
             }),
             "child creation must not be sent after the parent panics — \
              the spawned task should be aborted on Context drop"
