@@ -124,7 +124,12 @@ impl Context {
     /// Generate the next deterministic child ID.
     fn next_id(&self) -> String {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        format!("{}.{}", self.id, seq)
+        // The id is `<promiseId>:<lineage>`: a single `:` separates the promiseId
+        // (lineage origin) from the lineage, and `.` separates lineage segments.
+        // The first segment minted off a bare promiseId (id == origin_id) uses
+        // `:` (`root` -> `root:1`); every deeper segment uses `.` (`root:1.1`).
+        let sep = if self.id == self.origin_id { ":" } else { "." };
+        format!("{}{}{}", self.id, sep, seq)
     }
 
     /// Default timeout for child promises (24 hours).
@@ -389,7 +394,7 @@ impl Context {
     ///   result is never delivered back to the parent.
     ///
     /// The promise ID is computed deterministically as
-    /// `{origin_id}.{16-hex-char hash of (parent_id, seq)}`. Hashing keeps the
+    /// `{origin_id}:{16-hex-char hash of (parent_id, seq)}`. Hashing keeps the
     /// id length bounded regardless of nesting depth, while the use of a
     /// stable hash (`seahash`) over deterministic inputs preserves replay
     /// safety.
@@ -404,7 +409,7 @@ impl Context {
     /// ```
     pub fn detached(&self, func: &str, args: impl Serialize) -> DetachedTask<'_> {
         let raw = self.next_id();
-        let child_id = format!("{}.{}", self.origin_id, hash_id(&raw));
+        let child_id = format!("{}:{}", self.origin_id, hash_id(&raw));
         let (req, serialization_error) =
             match self.remote_create_req(&child_id, func, &args, None, None) {
                 Ok(req) => (req, None),
@@ -1929,9 +1934,9 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        // ChildWithLeaves creates two nested children inside root.0
+        // ChildWithLeaves creates two nested children inside root:0
         let _: i32 = ctx.run(ChildWithLeaves, ()).await.unwrap();
-        // Another direct child at root.1
+        // Another direct child at root:1
         let _: i32 = ctx.run(Bar, ()).await.unwrap();
 
         let requests = harness.sent_requests_json().await;
@@ -1949,12 +1954,12 @@ mod tests {
                 create["id"].as_str().unwrap(),
             );
         }
-        // Verify we got the nested ones too (root.0, root.0.0, root.0.1, root.1)
+        // Verify we got the nested ones too (root:0, root:0.0, root:0.1, root:1)
         let ids: Vec<&str> = creates.iter().map(|c| c["id"].as_str().unwrap()).collect();
-        assert!(ids.contains(&"root.0"), "should have root.0");
-        assert!(ids.contains(&"root.0.0"), "should have root.0.0");
-        assert!(ids.contains(&"root.0.1"), "should have root.0.1");
-        assert!(ids.contains(&"root.1"), "should have root.1");
+        assert!(ids.contains(&"root:0"), "should have root:0");
+        assert!(ids.contains(&"root:0.0"), "should have root:0.0");
+        assert!(ids.contains(&"root:0.1"), "should have root:0.1");
+        assert!(ids.contains(&"root:1"), "should have root:1");
     }
 
     // ── Match Function (target resolution) ─────────────────────────
@@ -2336,9 +2341,9 @@ mod tests {
             .map(|r| r["id"].as_str().unwrap().to_string())
             .collect();
 
-        assert_eq!(create_ids[0], "root.0");
-        assert_eq!(create_ids[1], "root.1");
-        assert_eq!(create_ids[2], "root.2");
+        assert_eq!(create_ids[0], "root:0");
+        assert_eq!(create_ids[1], "root:1");
+        assert_eq!(create_ids[2], "root:2");
     }
 
     #[tokio::test]
@@ -2356,9 +2361,9 @@ mod tests {
             .map(|r| r["id"].as_str().unwrap().to_string())
             .collect();
 
-        assert!(create_ids.contains(&"root.0".to_string()));
-        assert!(create_ids.contains(&"root.0.0".to_string()));
-        assert!(create_ids.contains(&"root.0.1".to_string()));
+        assert!(create_ids.contains(&"root:0".to_string()));
+        assert!(create_ids.contains(&"root:0.0".to_string()));
+        assert!(create_ids.contains(&"root:0.1".to_string()));
     }
 
     // ── Concurrent vs Sequential execution ─────────────────────────
@@ -2791,7 +2796,7 @@ mod tests {
     #[tokio::test]
     async fn sleep_returns_ok_when_already_resolved() {
         let harness = TestHarness::new();
-        let sleep_id = "root.0";
+        let sleep_id = "root:0";
         harness.settle_promise_in_stub(sleep_id, ()).await;
 
         let effects = harness.build_effects(vec![resolved_promise(sleep_id, ())]);
@@ -2821,7 +2826,7 @@ mod tests {
     #[tokio::test]
     async fn sleep_spawn_resolved_returns_ok() {
         let harness = TestHarness::new();
-        let sleep_id = "root.0";
+        let sleep_id = "root:0";
         harness.settle_promise_in_stub(sleep_id, ()).await;
 
         let effects = harness.build_effects(vec![resolved_promise(sleep_id, ())]);
@@ -3007,7 +3012,7 @@ mod tests {
     #[tokio::test]
     async fn promise_resolved_returns_value() {
         let harness = TestHarness::new();
-        let promise_id = "root.0";
+        let promise_id = "root:0";
         harness
             .settle_promise_in_stub(promise_id, "hello".to_string())
             .await;
@@ -3049,7 +3054,7 @@ mod tests {
         let _ = finalize_context(&ctx, Ok(0)).await;
 
         let ids = create_ids_in_order(&harness).await;
-        let expected: Vec<String> = (0..8).map(|i| format!("root.{}", i)).collect();
+        let expected: Vec<String> = (0..8).map(|i| format!("root:{}", i)).collect();
         assert_eq!(
             ids, expected,
             "creations must reach the server in call order"
@@ -3062,19 +3067,21 @@ mod tests {
         let effects = harness.build_effects(vec![]);
         let ctx = test_context("root", effects);
 
-        let _h0 = ctx.run(Bar, ()).spawn().unwrap(); // root.0
-        let _h1 = ctx.rpc::<i32>("remote", &()).spawn().unwrap(); // root.1
-        let _: i32 = ctx.run(Baz, ()).await.unwrap(); // root.2 (sequential)
-        let _h3 = ctx.sleep(Duration::from_secs(30)).spawn().unwrap(); // root.3
+        let _h0 = ctx.run(Bar, ()).spawn().unwrap(); // root:0
+        let _h1 = ctx.rpc::<i32>("remote", &()).spawn().unwrap(); // root:1
+        let _: i32 = ctx.run(Baz, ()).await.unwrap(); // root:2 (sequential)
+        let _h3 = ctx.sleep(Duration::from_secs(30)).spawn().unwrap(); // root:3
         let _ = finalize_context(&ctx, Ok(0)).await;
 
         let ids = create_ids_in_order(&harness).await;
-        // Only the direct children of root, in terminal-op call order.
+        // Only the direct children of root, in terminal-op call order. A direct
+        // child has exactly one `:` (the promiseId->lineage boundary) and no `.`
+        // (which would mark a deeper lineage segment).
         let root_children: Vec<&String> = ids
             .iter()
-            .filter(|id| id.matches('.').count() == 1)
+            .filter(|id| id.matches(':').count() == 1 && !id.contains('.'))
             .collect();
-        assert_eq!(root_children, ["root.0", "root.1", "root.2", "root.3"]);
+        assert_eq!(root_children, ["root:0", "root:1", "root:2", "root:3"]);
     }
 
     #[tokio::test]
@@ -3106,7 +3113,7 @@ mod tests {
 
         // Success-gating: only the first creation ever reached the server.
         let ids = create_ids_in_order(&harness).await;
-        assert_eq!(ids, ["root.0"], "successors must not issue promise.create");
+        assert_eq!(ids, ["root:0"], "successors must not issue promise.create");
     }
 
     #[tokio::test]
@@ -3151,7 +3158,7 @@ mod tests {
         let outcome = finalize_context(&ctx, Err::<i32, _>(Error::Suspended)).await;
         match &outcome {
             Outcome::Suspended { remote_todos } => {
-                assert_eq!(remote_todos, &["root.0".to_string()]);
+                assert_eq!(remote_todos, &["root:0".to_string()]);
             }
             other => panic!("expected Suspended, got {:?}", other),
         }
@@ -3160,7 +3167,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_spawn_preloaded_resolved_returns_value_via_handle() {
         let harness = TestHarness::new();
-        let effects = harness.build_effects(vec![resolved_promise("root.0", 99_i32)]);
+        let effects = harness.build_effects(vec![resolved_promise("root:0", 99_i32)]);
         let ctx = test_context("root", effects);
 
         // Replay short-circuit flows through the handle's oneshot.
@@ -3177,7 +3184,7 @@ mod tests {
 
         let handle = ctx.detached("audit", ()).spawn().unwrap();
         let id = handle.id().await.unwrap();
-        assert!(id.starts_with("root."), "id = {id}");
+        assert!(id.starts_with("root:"), "id = {id}");
 
         // The promise existed on the server before the handle resolved.
         let ids = create_ids_in_order(&harness).await;
@@ -3196,11 +3203,11 @@ mod tests {
 
         let handle = ctx.rpc::<i32>("remote", &()).spawn().unwrap();
         let id = handle.id().await.unwrap();
-        assert_eq!(id, "root.0");
+        assert_eq!(id, "root:0");
 
         // At the moment id() resolved, the create request had reached the stub.
         let ids = create_ids_in_order(&harness).await;
-        assert_eq!(ids, ["root.0"]);
+        assert_eq!(ids, ["root:0"]);
 
         let _ = finalize_context(&ctx, Ok(0)).await;
     }

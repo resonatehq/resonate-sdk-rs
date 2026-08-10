@@ -2424,8 +2424,8 @@ mod tests {
 
         let id: String = r.run("e2e-det", detacher_one, ()).await.unwrap();
 
-        // Format: "{origin}.{16 hex chars}"
-        let prefix = "e2e-det.";
+        // Format: "{origin}:{16 hex chars}"
+        let prefix = "e2e-det:";
         assert!(id.starts_with(prefix), "id = {}", id);
         let suffix = &id[prefix.len()..];
         assert_eq!(
@@ -2472,7 +2472,7 @@ mod tests {
         .await
         .expect("workflow should complete without waiting on detached promise")
         .unwrap();
-        assert!(id.starts_with("e2e-det-nb."));
+        assert!(id.starts_with("e2e-det-nb:"));
     }
 
     #[tokio::test]
@@ -2498,7 +2498,7 @@ mod tests {
         assert_ne!(ids[1], ids[2]);
         assert_ne!(ids[0], ids[2]);
         for id in &ids {
-            assert!(id.starts_with("e2e-det-many."));
+            assert!(id.starts_with("e2e-det-many:"));
         }
     }
 
