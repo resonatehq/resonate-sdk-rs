@@ -44,7 +44,6 @@ pub struct ResonateConfig {
     pub encryptor: Option<Box<dyn Encryptor>>,
     /// Custom network implementation (overrides url).
     pub network: Option<Arc<dyn Network>>,
-
 }
 
 /// Return value from `schedule()`.
@@ -65,7 +64,6 @@ pub struct Resonate {
     // Identity
     pid: String,
     ttl: u64,
-
 
     // Infrastructure
     codec: Codec,
@@ -990,7 +988,7 @@ impl<'a, Args: Serialize + Send + 'a> IntoFuture for ResScheduleTask<'a, Args> {
             });
             let encoded_param = self.resonate.codec.encode(&param_data)?;
 
-            let template = format!("{{{{.id}}}}.{{{{.timestamp}}}}");
+            let template = "{{.id}}.{{.timestamp}}".to_string();
 
             self.resonate
                 .schedules
