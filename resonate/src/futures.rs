@@ -238,19 +238,19 @@ mod tests {
     async fn id_returns_after_creation_succeeds() {
         let (created_tx, created_rx) = creation_channel();
         let (_result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<i32>>();
-        let future: RemoteFuture<i32> = RemoteFuture::pending("p.1".into(), result_rx, created_rx);
+        let future: RemoteFuture<i32> = RemoteFuture::pending("p:1".into(), result_rx, created_rx);
 
         created_tx.send(CreationState::Created).unwrap();
-        assert_eq!(future.id().await.unwrap(), "p.1");
+        assert_eq!(future.id().await.unwrap(), "p:1");
         // id() can be called more than once
-        assert_eq!(future.id().await.unwrap(), "p.1");
+        assert_eq!(future.id().await.unwrap(), "p:1");
     }
 
     #[tokio::test]
     async fn id_fails_when_creation_failed() {
         let (created_tx, created_rx) = creation_channel();
         let (_result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<i32>>();
-        let future: RemoteFuture<i32> = RemoteFuture::pending("p.1".into(), result_rx, created_rx);
+        let future: RemoteFuture<i32> = RemoteFuture::pending("p:1".into(), result_rx, created_rx);
 
         created_tx
             .send(CreationState::Failed("boom".into()))
