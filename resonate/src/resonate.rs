@@ -44,8 +44,7 @@ pub struct ResonateConfig {
     pub encryptor: Option<Box<dyn Encryptor>>,
     /// Custom network implementation (overrides url).
     pub network: Option<Arc<dyn Network>>,
-    /// ID prefix for all promise/task IDs (or from RESONATE_PREFIX).
-    pub prefix: Option<String>,
+
 }
 
 /// Return value from `schedule()`.
@@ -66,7 +65,7 @@ pub struct Resonate {
     // Identity
     pid: String,
     ttl: u64,
-    id_prefix: String,
+
 
     // Infrastructure
     codec: Codec,
@@ -110,12 +109,11 @@ impl Resonate {
         Self::local_with(ResonateConfig::default())
     }
 
-    /// Local-only mode with caller-supplied config (prefix, pid, ttl, etc.).
+    /// Local-only mode with caller-supplied config (pid, ttl, etc.).
     ///
     /// Like [`Resonate::local`], this always uses an in-process
     /// `LocalNetwork` — `config.url` and any `RESONATE_URL`/`RESONATE_HOST`
-    /// env vars are ignored. Use this in tests or local-mode applications
-    /// that need to set fields like `prefix` while staying off the network.
+    /// env vars are ignored.
     pub fn local_with(mut config: ResonateConfig) -> Self {
         config.pid.get_or_insert_with(|| "default".to_string());
         config.group.get_or_insert_with(|| "default".to_string());
@@ -141,20 +139,9 @@ impl Resonate {
             token,
             encryptor: config_encryptor,
             network: config_network,
-            prefix: config_prefix,
         } = config;
 
         let ttl = config_ttl.unwrap_or(60_000);
-
-        // Resolve prefix
-        let prefix = config_prefix
-            .or_else(|| std::env::var("RESONATE_PREFIX").ok())
-            .unwrap_or_default();
-        let id_prefix = if prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}:", prefix)
-        };
 
         // Resolve URL
         let resolved_url = url
@@ -242,7 +229,6 @@ impl Resonate {
         let resonate = Self {
             pid,
             ttl,
-            id_prefix,
             codec,
             network: network.clone(),
             core,
@@ -390,7 +376,6 @@ impl Resonate {
         args: serde_json::Value,
         opts: &Options,
     ) -> Result<(String, crate::types::PromiseCreateReq)> {
-        let prefixed_id = self.prefix_id(id);
         let timeout_at = now_ms().saturating_add(opts.timeout.as_millis() as i64);
         // NOTE: function versioning is not yet supported by this SDK.
         let param_data = serde_json::json!({
@@ -400,11 +385,11 @@ impl Resonate {
         let encoded_param = self.codec.encode(&param_data)?;
         let mut tags = opts.tags.clone();
         tags.reserve(5);
-        Self::build_root_tags(&prefixed_id, &opts.target, &mut tags);
+        Self::build_root_tags(id, &opts.target, &mut tags);
         Ok((
-            prefixed_id.clone(),
+            id.to_string(),
             crate::types::PromiseCreateReq {
-                id: prefixed_id,
+                id: id.to_string(),
                 timeout_at,
                 param: encoded_param,
                 tags,
@@ -428,7 +413,7 @@ impl Resonate {
             }
         }
 
-        let (prefixed_id, action) = self.build_promise_create_req(id, func_name, args, &opts)?;
+        let (id, action) = self.build_promise_create_req(id, func_name, args, &opts)?;
         let ttl = self.safe_ttl();
         let outcome = self
             .sender
@@ -436,7 +421,7 @@ impl Resonate {
             .await?;
 
         match outcome {
-            TaskCreateOutcome::Conflict => self.create_handle_from_id(prefixed_id).await,
+            TaskCreateOutcome::Conflict => self.create_handle_from_id(id).await,
             TaskCreateOutcome::Created(result) => {
                 // If task is acquired, fire-and-forget core execution
                 if result.task.state == crate::types::TaskState::Acquired {
@@ -475,7 +460,7 @@ impl Resonate {
                     });
                 }
 
-                self.create_handle_from_id(prefixed_id).await
+                self.create_handle_from_id(id).await
             }
         }
     }
@@ -488,15 +473,14 @@ impl Resonate {
         args: serde_json::Value,
         opts: Options,
     ) -> Result<ResonateHandle<T>> {
-        let (prefixed_id, req) = self.build_promise_create_req(id, func_name, args, &opts)?;
+        let (_, req) = self.build_promise_create_req(id, func_name, args, &opts)?;
         self.sender.promise_create(req).await?;
-        self.create_handle_from_id(prefixed_id).await
+        self.create_handle_from_id(id.to_string()).await
     }
 
     /// Get a handle to an existing promise.
     pub async fn get<T: DeserializeOwned>(&self, id: &str) -> Result<ResonateHandle<T>> {
-        let prefixed_id = self.prefix_id(id);
-        self.create_handle_from_id(prefixed_id).await
+        self.create_handle_from_id(id.to_string()).await
     }
 
     /// Create a schedule for periodic function execution. Returns a builder
@@ -556,11 +540,6 @@ impl Resonate {
     }
 
     #[cfg(test)]
-    pub fn id_prefix(&self) -> &str {
-        &self.id_prefix
-    }
-
-    #[cfg(test)]
     pub fn transport(&self) -> Transport {
         Transport::new(self.network.clone())
     }
@@ -577,15 +556,6 @@ impl Resonate {
     /// TTL capped to i64::MAX for Sender methods that take i64.
     fn safe_ttl(&self) -> i64 {
         self.ttl.min(i64::MAX as u64) as i64
-    }
-
-    /// Prepend the configured prefix to an ID.
-    fn prefix_id(&self, id: &str) -> String {
-        if self.id_prefix.is_empty() {
-            id.to_string()
-        } else {
-            format!("{}{}", self.id_prefix, id)
-        }
     }
 
     /// Wire up the transport message handler to dispatch Execute and Unblock
@@ -1020,7 +990,7 @@ impl<'a, Args: Serialize + Send + 'a> IntoFuture for ResScheduleTask<'a, Args> {
             });
             let encoded_param = self.resonate.codec.encode(&param_data)?;
 
-            let template = format!("{}{{{{.id}}}}.{{{{.timestamp}}}}", self.resonate.id_prefix);
+            let template = format!("{{{{.id}}}}.{{{{.timestamp}}}}");
 
             self.resonate
                 .schedules
@@ -1087,7 +1057,6 @@ mod tests {
         let r = Resonate::local();
         assert_eq!(r.pid(), "default");
         assert_eq!(r.ttl(), u64::MAX);
-        assert_eq!(r.id_prefix(), "");
     }
 
     #[tokio::test]
@@ -1100,29 +1069,6 @@ mod tests {
         assert_eq!(r.pid(), "worker-1");
         assert!(r.network().unicast().contains("worker-1"));
         assert!(r.network().unicast().contains("workers"));
-    }
-
-    #[tokio::test]
-    async fn config_with_prefix() {
-        let r = Resonate::local_with(ResonateConfig {
-            pid: Some("test".into()),
-            group: Some("g1".into()),
-            ttl: Some(30_000),
-            prefix: Some("myapp".into()),
-            ..Default::default()
-        });
-        assert_eq!(r.pid(), "test");
-        assert_eq!(r.id_prefix(), "myapp:");
-        assert_eq!(r.ttl(), 30_000);
-    }
-
-    #[tokio::test]
-    async fn config_with_empty_prefix() {
-        let r = Resonate::local_with(ResonateConfig {
-            prefix: Some("".into()),
-            ..Default::default()
-        });
-        assert_eq!(r.id_prefix(), "");
     }
 
     #[tokio::test]
@@ -1206,19 +1152,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_spawn_with_prefix_prepends_to_id() {
-        let r = Resonate::local_with(ResonateConfig {
-            prefix: Some("app".into()),
-            pid: Some("default".into()),
-            ..Default::default()
-        });
-        r.register(noop).unwrap();
-
-        let handle = r.run("my-id", noop, ()).spawn().await.unwrap();
-        assert_eq!(handle.id, "app:my-id");
-    }
-
-    #[tokio::test]
     async fn run_spawn_creates_task_and_promise() {
         let r = Resonate::local();
         r.register(noop).unwrap();
@@ -1289,17 +1222,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_spawn_with_prefix() {
-        let r = Resonate::local_with(ResonateConfig {
-            prefix: Some("svc".into()),
-            ..Default::default()
-        });
-
-        let handle = r.rpc::<_, ()>("rpc-2", "remote", ()).spawn().await.unwrap();
-        assert_eq!(handle.id, "svc:rpc-2");
-    }
-
-    #[tokio::test]
     async fn rpc_spawn_sets_scope_global() {
         let r = Resonate::local();
         // Verifying RPC succeeds — tags (scope=global, target) are set internally
@@ -1360,22 +1282,6 @@ mod tests {
         let handle = r.get::<()>("get-test").await;
         assert!(handle.is_ok());
         assert_eq!(handle.unwrap().id, "get-test");
-    }
-
-    #[tokio::test]
-    async fn get_with_prefix_prepends_prefix() {
-        let r = Resonate::local_with(ResonateConfig {
-            prefix: Some("ns".into()),
-            ..Default::default()
-        });
-
-        // Create via RPC (which prepends prefix)
-        r.rpc::<_, ()>("p1", "func", ()).spawn().await.unwrap();
-
-        // Get with the unprefixed ID (prefix is prepended internally)
-        let handle = r.get::<()>("p1").await;
-        assert!(handle.is_ok());
-        assert_eq!(handle.unwrap().id, "ns:p1");
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1568,49 +1474,16 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  ID Prefix Tests
+    //  ID Tests
     // ═══════════════════════════════════════════════════════════════
 
     #[tokio::test]
-    async fn no_prefix_leaves_id_unchanged() {
+    async fn id_is_used_raw_without_prefix() {
         let r = Resonate::local();
         r.register(noop).unwrap();
 
         let handle = r.run("my-id", noop, ()).spawn().await.unwrap();
         assert_eq!(handle.id, "my-id");
-    }
-
-    #[tokio::test]
-    async fn prefix_is_prepended_with_colon() {
-        let r = Resonate::local_with(ResonateConfig {
-            prefix: Some("prefix".into()),
-            ..Default::default()
-        });
-        r.register(noop).unwrap();
-
-        let handle = r.run("my-id", noop, ()).spawn().await.unwrap();
-        assert_eq!(handle.id, "prefix:my-id");
-    }
-
-    #[tokio::test]
-    async fn prefix_applied_consistently_to_run_rpc_and_get() {
-        let r = Resonate::local_with(ResonateConfig {
-            prefix: Some("p".into()),
-            ..Default::default()
-        });
-        r.register(noop).unwrap();
-
-        // run().spawn() with prefix
-        let h1 = r.run("id1", noop, ()).spawn().await.unwrap();
-        assert_eq!(h1.id, "p:id1");
-
-        // rpc().spawn() with prefix
-        let h2 = r.rpc::<_, ()>("id2", "remote", ()).spawn().await.unwrap();
-        assert_eq!(h2.id, "p:id2");
-
-        // get with prefix (the promise was created as "p:id2")
-        let h3 = r.get::<()>("id2").await.unwrap();
-        assert_eq!(h3.id, "p:id2");
     }
 
     // ═══════════════════════════════════════════════════════════════
