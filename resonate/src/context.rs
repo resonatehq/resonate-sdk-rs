@@ -3335,9 +3335,9 @@ mod tests {
         }
     }
 
-    async fn run_id_format_workflow(harness: &TestHarness) -> Vec<serde_json::Value> {
+    async fn run_id_format_workflow(harness: &TestHarness, root: &str) -> Vec<serde_json::Value> {
         let effects = harness.build_effects(vec![]);
-        let ctx = test_context("wf", effects);
+        let ctx = test_context(root, effects);
         let _: i32 = ctx.run(IdFormatMid, ()).await.unwrap();
         let _: i32 = ctx.run(IdFormatMid, ()).await.unwrap();
         let _ = finalize_context(&ctx, Ok(0)).await;
@@ -3352,11 +3352,18 @@ mod tests {
 
     #[tokio::test]
     async fn every_created_promise_passes_server_validation() {
-        let harness = TestHarness::new();
-        let creates = run_id_format_workflow(&harness).await;
-        assert!(creates.len() >= 8, "expected a real tree: {:?}", creates);
-        for create in &creates {
-            server_validate(create["id"].as_str().unwrap(), &create["tags"]);
+        // A dotted root is a caller's prerogative: '.' is only read below the
+        // origin, so every id minted under it still validates and still shares
+        // that origin.
+        for root in ["wf", "my.app.workflow"] {
+            let harness = TestHarness::new();
+            let creates = run_id_format_workflow(&harness, root).await;
+            assert!(creates.len() >= 8, "expected a real tree: {:?}", creates);
+            for create in &creates {
+                let id = create["id"].as_str().unwrap();
+                server_validate(id, &create["tags"]);
+                assert_eq!(server_origin(id), root, "id {} origin", id);
+            }
         }
     }
 
@@ -3367,7 +3374,7 @@ mod tests {
         // promise a workflow creates — detached children included — must
         // share it.
         let harness = TestHarness::new();
-        let creates = run_id_format_workflow(&harness).await;
+        let creates = run_id_format_workflow(&harness, "wf").await;
         for create in &creates {
             let id = create["id"].as_str().unwrap();
             assert_eq!(server_origin(id), "wf", "id {} origin", id);
@@ -3383,7 +3390,7 @@ mod tests {
     #[tokio::test]
     async fn child_ids_are_colon_then_dot_separated() {
         let harness = TestHarness::new();
-        let creates = run_id_format_workflow(&harness).await;
+        let creates = run_id_format_workflow(&harness, "wf").await;
         let ids: Vec<&str> = creates.iter().map(|c| c["id"].as_str().unwrap()).collect();
         // First level below the root joins with ':', deeper levels with '.'.
         for want in ["wf:0", "wf:0.0", "wf:0.0.0"] {
@@ -3402,7 +3409,7 @@ mod tests {
         // Detached ids are `{origin}:d{16 hex}` — one segment past the origin
         // no matter how deep the spawning context is.
         let harness = TestHarness::new();
-        let creates = run_id_format_workflow(&harness).await;
+        let creates = run_id_format_workflow(&harness, "wf").await;
         let detached: Vec<&serde_json::Value> = creates
             .iter()
             .filter(|c| c["id"].as_str().unwrap().starts_with("wf:d"))
@@ -3424,7 +3431,7 @@ mod tests {
     #[tokio::test]
     async fn prefix_tag_is_not_emitted() {
         let harness = TestHarness::new();
-        let creates = run_id_format_workflow(&harness).await;
+        let creates = run_id_format_workflow(&harness, "wf").await;
         for create in &creates {
             assert!(
                 create["tags"].get("resonate:prefix").is_none(),

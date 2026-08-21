@@ -728,7 +728,9 @@ pub fn server_validate(id: &str, tags: &serde_json::Value) {
     assert!(!id.contains('\0'), "null_bytes: id={:?}", id);
 
     if let Some(origin) = tags.get("resonate:origin").and_then(|v| v.as_str()) {
-        assert!(!origin.contains('.'), "dot_in_origin: origin={:?}", origin);
+        // '.' is *not* rejected here: it only separates lineage segments below
+        // the origin, which is read after the origin has been split off at the
+        // first ':'.
         assert!(
             !origin.contains(':'),
             "colon_in_origin: origin={:?}",

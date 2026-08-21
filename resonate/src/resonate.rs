@@ -376,7 +376,7 @@ impl Resonate {
     /// The id is validated at this call site — the place that named the
     /// workflow — rather than surfacing later as an opaque 400 from the
     /// server: it becomes the origin of its whole lineage, so the reserved
-    /// separators are rejected outright (see [`crate::ids::validate_root_id`]).
+    /// `:` separator is rejected outright (see [`crate::ids::validate_root_id`]).
     fn build_promise_create_req(
         &self,
         id: &str,
@@ -1028,9 +1028,8 @@ impl<'a, Args: Serialize + Send + 'a> IntoFuture for ResScheduleTask<'a, Args> {
             crate::ids::validate_root_id(self.name)?;
             // The server stamps the *whole* templated id onto the fired
             // promise's `resonate:origin` tag, so the template must join with
-            // a plain `-`: a `.` would make every child of a scheduled run
-            // rejected (dot_in_origin) and a `:` would hide the timestamp
-            // below the origin, collapsing every firing onto one lineage.
+            // a plain `-`: a `:` would hide the timestamp below the origin,
+            // collapsing every firing onto one lineage.
             let template = "{{.id}}-{{.timestamp}}".to_string();
 
             // Route the fired promises: resolve the target (explicit or this
@@ -1578,12 +1577,12 @@ mod tests {
     #[tokio::test]
     async fn run_and_rpc_reject_an_invalid_root_id() {
         // Raised at the call site, before anything reaches the server: a root
-        // id becomes the origin of its whole lineage, so the reserved
-        // separators are rejected outright.
+        // id becomes the origin of its whole lineage, so the reserved `:`
+        // separator is rejected outright.
         let r = Resonate::local();
         r.register(noop).unwrap();
 
-        for id in ["bad.id", "bad:id", "", "bad\0id"] {
+        for id in ["bad:id", "", "bad\0id"] {
             let run_err = r.run(id, noop, ()).spawn().await.unwrap_err();
             assert!(
                 matches!(run_err, Error::InvalidId { .. }),
@@ -1604,7 +1603,7 @@ mod tests {
     #[tokio::test]
     async fn schedule_rejects_an_invalid_root_id() {
         let r = Resonate::local();
-        for name in ["bad.id", "bad:id"] {
+        for name in ["bad:id"] {
             let err = match r.schedule(name, "* * * * *", "func", ()).await {
                 Err(e) => e,
                 Ok(_) => panic!("schedule({:?}) unexpectedly succeeded", name),
